@@ -726,7 +726,7 @@ cmd_install() {
   step "写入配置并启动"
   save_env
   write_compose
-  compose pull -q
+  pull_images
   # 配置内嵌在 compose.yaml 里，只改内容时 Compose 不会重建容器，
   # 会导致新 UUID / 路径不生效，所以这里强制重建。--remove-orphans 顺带处理
   # 模式切换：从 caddy 切到 nginx 时 compose.yaml 里没了 caddy 服务，旧容器会被删掉
@@ -762,6 +762,14 @@ cmd_install() {
   grn "安装完成。以后重新运行本脚本即可更新、查看状态或修改配置。"
 }
 
+# 拉镜像。回退过的标签是 rollback——那是本地打的，Docker Hub 上没有，
+# 照常 compose pull 会整个失败。安装 / 改配置不该顺手换版本，所以
+# 带 rollback 标签的服务跳过不拉，用本地已有的镜像
+pull_images() {
+  if [[ $V2FLY_TAG != rollback ]]; then compose pull -q v2ray; fi
+  if [[ $FRONT == caddy && $CADDY_TAG != rollback ]]; then compose pull -q caddy; fi
+}
+
 cmd_update() {
   preflight; need_docker
   [[ -f $COMPOSE_FILE ]] || die "还没有安装，请先运行「安装」"
@@ -770,25 +778,45 @@ cmd_update() {
   old_v2=$(docker inspect -f '{{.Image}}' v2ray 2>/dev/null || true)
   old_caddy=$(docker inspect -f '{{.Image}}' caddy 2>/dev/null || true)
 
+  # 上次回退过的话标签停在 rollback。更新的意思就是再试一次最新版，
+  # 所以先把标签恢复成默认，否则 pull 会因为 Docker Hub 上没有这个标签而失败
+  if [[ $V2FLY_TAG == rollback ]]; then V2FLY_TAG=latest; fi
+  if [[ $CADDY_TAG == rollback ]]; then CADDY_TAG=2; fi
+  save_env
+
   step "拉取最新镜像并重建容器"
   compose pull -q
   compose up -d --force-recreate --remove-orphans
 
   if wait_ready; then
-    # 新版本没问题，再删掉旧镜像，保证升级失败时还能回退
-    [[ -n $old_v2 ]] && docker rmi "$old_v2" >/dev/null 2>&1
-    [[ -n $old_caddy ]] && docker rmi "$old_caddy" >/dev/null 2>&1
+    # 新版本没问题，再清掉旧镜像。先摘掉 rollback 标签，不然按 ID 删会因为
+    # 「被多个标签引用」失败。这些命令失败都无所谓（没新版本时新旧是同一个
+    # 镜像、正被容器占用，rmi 必然失败），所以不能用 && 串起来——set -e 下
+    # && 后面的命令失败照样会终止脚本，会在打完 ✓ 之后无声退出
+    docker rmi v2fly/v2fly-core:rollback caddy:rollback >/dev/null 2>&1 || true
+    if [[ -n $old_v2 ]]; then docker rmi "$old_v2" >/dev/null 2>&1 || true; fi
+    if [[ -n $old_caddy ]]; then docker rmi "$old_caddy" >/dev/null 2>&1 || true; fi
     cmd_status
     return 0
   fi
 
   red "新版本有问题"
   if [[ -n $old_v2 || -n $old_caddy ]] && confirm "是否回退到更新前的版本？" y; then
-    [[ -n $old_v2 ]] && docker tag "$old_v2" v2fly/v2fly-core:rollback && V2FLY_TAG=rollback
-    [[ -n $old_caddy ]] && docker tag "$old_caddy" caddy:rollback && CADDY_TAG=rollback
+    if [[ -n $old_v2 ]]; then
+      docker tag "$old_v2" v2fly/v2fly-core:rollback || die "旧的 V2Ray 镜像已不存在，无法回退"
+      V2FLY_TAG=rollback
+    fi
+    if [[ -n $old_caddy ]]; then
+      docker tag "$old_caddy" caddy:rollback || die "旧的 Caddy 镜像已不存在，无法回退"
+      CADDY_TAG=rollback
+    fi
     save_env; write_compose
     compose up -d --force-recreate
-    wait_ready && grn "✓ 已回退到更新前的版本" || red "回退后仍不正常，请查看日志"
+    if wait_ready; then
+      grn "✓ 已回退到更新前的版本。下次「更新」会再次尝试最新版"
+    else
+      red "回退后仍不正常，请查看日志"
+    fi
   else
     die "更新后服务未就绪"
   fi
