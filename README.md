@@ -14,6 +14,8 @@
 
 Docker、Docker Compose、qrencode 这些依赖脚本会自己装。
 
+已有 Docker 时不会替换 Docker 引擎。缺少 Compose 时，脚本会从 Docker 官方 GitHub 发布页下载固定版本 [v2.24.7](https://github.com/docker/compose/releases/tag/v2.24.7) 的独立插件，并校验 SHA-256；这种安装方式不会通过 APT 自动更新。新装 Docker 前会补齐 APT 软件源目录，兼容缺少该目录的精简系统。
+
 ## 使用
 
 所有子命令都要 root（配置在 `/root/v2ray-stack` 下，还要动 Docker、apt、systemd 和 80/443 端口）。先 `sudo -i` 切到 root，然后：
@@ -47,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v
 | 子命令 | 作用 |
 | --- | --- |
 | `install` | 安装，或修改域名 / UUID / 路径后重新应用 |
-| `update` | 拉最新镜像重建容器，自检不过可一键回退旧版本 |
+| `update` | 拉最新镜像重建容器，失败时自动恢复旧配置和旧镜像 |
 | `status` | 容器状态、版本、证书有效期、链路自检 |
 | `show` | 打印客户端配置、vmess 链接和二维码（`show plain` 不画二维码） |
 | `uninstall` | 删除容器，可选一并删除证书和配置目录 |
@@ -142,7 +144,11 @@ Caddy 模式要独占 80 和 443，机器上装了宝塔面板（或任何 Nginx
 3. **最后查真连通**：起一个临时 V2Ray 客户端容器，用刚生成的 UUID 真的走一遍代理去访问外网。这一步过了，说明 UUID、路径、TLS 全都对，而不只是端口开着。
 4. **CDN 模式下还要查边缘**：上面几项为了排除干扰都绕开了 Cloudflare，所以照不出边缘的毛病。开了 CDN 时会按域名真实解析再做一次 WebSocket 握手，也就是客户端实际走的那条路。不过就打印 curl 的原话和 HTTP 状态码，并按状态码给出方向：连不上或 TLS 失败、没被当作 WebSocket 升级（多半是 Cloudflare 的 WebSockets 开关）、被 WAF 拦下、Cloudflare 连不上源站（52x）等。
 
-任何一步没过都会打印对应容器的日志和排查方向。`update` 也走同一套自检，新版本不过就问你要不要回退——回退用的是更新前那个镜像，所以确认没问题之前旧镜像不会被删。回退后镜像标签会停在 `rollback`：这时重跑「安装 / 修改配置」不会去拉镜像，继续用回退的版本；下次「更新」则会再次尝试最新版。
+任何一步没过都会打印对应容器的日志和排查方向。连接测试使用本次运行创建的临时容器，只按其 ID 清理；临时配置中的 UUID 仅 root 可读，退出时清理。
+
+修改已有安装或运行 `update` 时，会先备份配置并记录旧镜像。拉取失败会恢复配置；重建或自检失败会尝试恢复原配置和原镜像，而不是重新下载可能已变化的 `latest`。恢复失败时保留备份目录并打印位置，命令以失败状态退出。首次安装没有旧版本可恢复，失败时保留配置供排查。
+
+需要恢复容器时，镜像标签会停在 `rollback`：这时重跑「安装 / 修改配置」不会去拉镜像，继续用回退的版本；下次「更新」则会再次尝试最新版。更新成功后也保留旧镜像，不自动清理。
 
 ## 文件位置
 
@@ -184,6 +190,15 @@ docker logs --tail 50 caddy
 ```bash
 docker logs --tail 50 v2ray
 ```
+
+## 本地验证
+
+```bash
+bash -n v2ray.sh
+bash tests/regression.sh
+```
+
+回归测试需要 Bash 和 Python 3，使用模拟命令检查安装分支、资源清理和失败恢复，不下载依赖、不操作真实 Docker 或系统配置。它不能代替服务器上的实际部署验证。
 
 ## 说明
 

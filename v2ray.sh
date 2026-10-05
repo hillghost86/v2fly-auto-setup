@@ -60,27 +60,112 @@ compose() { docker compose --project-directory "$STACK_DIR" "$@"; }
 CHECK_PID=""
 CADDY_STOPPED=no
 TMP_DIRS=()
+E2E_CID_FILE=""
+E2E_CID_FILES=()
+RECOVERY_DIR=""
+RECOVERY_ACTIVE=no
+RECOVERY_UP=no
+RECOVERY_V2="" RECOVERY_CADDY=""
 
 cleanup() {
   # 清理不能因为某一步失败就中断：docker rm 在容器本来就不存在时会返回非 0，
   # 若保留 set -e，后面「恢复 Caddy」就被跳过了，服务会一直停着
   set +e
   [[ -n $CHECK_PID ]] && kill "$CHECK_PID" 2>/dev/null
-  docker rm -f v2ray-e2e >/dev/null 2>&1
+  if [[ $RECOVERY_ACTIVE == yes ]]; then
+    recover_stack || red "恢复失败，备份保留在 $RECOVERY_DIR"
+  fi
   if [[ $CADDY_STOPPED == yes ]]; then
     ylw "正在恢复 Caddy 运行…"
     compose start caddy >/dev/null 2>&1
+  fi
+  local cid_file
+  if ((${#E2E_CID_FILES[@]})); then
+    for cid_file in "${E2E_CID_FILES[@]}"; do
+      if [[ -s $cid_file ]]; then docker rm -f "$(cat "$cid_file")" >/dev/null 2>&1; fi
+    done
   fi
   ((${#TMP_DIRS[@]})) && rm -rf "${TMP_DIRS[@]}"
   return 0
 }
 # 只把 cleanup 挂在 EXIT 上。INT / TERM 若直接调 cleanup，处理完会从被打断的
 # 地方继续往下跑——按了 Ctrl-C 却照样把安装做完。改成主动 exit，由 EXIT 统一清理
-trap cleanup EXIT
+trap 'rc=$?; cleanup; exit "$rc"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-mktmp() { local d; d=$(mktemp -d); TMP_DIRS+=("$d"); printf '%s' "$d"; }
+mktmp() { local tmp_created; tmp_created=$(mktemp -d) || return 1; TMP_DIRS+=("$tmp_created"); printf -v "$1" '%s' "$tmp_created"; }
+
+# 备份不属于临时目录：恢复失败时必须留下配置与旧镜像 ID。
+begin_recovery() {
+  mkdir -p "$STACK_DIR" || return 1
+  RECOVERY_DIR=$(mktemp -d "$STACK_DIR/.recovery.XXXXXX") || return 1
+  [[ ! -f $ENV_FILE ]] || cp -p "$ENV_FILE" "$RECOVERY_DIR/env" || return 1
+  [[ ! -f $COMPOSE_FILE ]] || cp -p "$COMPOSE_FILE" "$RECOVERY_DIR/compose.yaml" || return 1
+  local service project
+  for service in v2ray caddy; do
+    if docker inspect "$service" >/dev/null 2>&1; then
+      project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$service" 2>/dev/null || true)
+      [[ $project == v2ray ]] || { red "同名容器 $service 不属于本项目，停止修改；备份：$RECOVERY_DIR"; return 1; }
+    fi
+  done
+  RECOVERY_V2=$(docker inspect -f '{{.Image}}' v2ray 2>/dev/null || true)
+  RECOVERY_CADDY=$(docker inspect -f '{{.Image}}' caddy 2>/dev/null || true)
+  printf '%s\n%s\n' "$RECOVERY_V2" "$RECOVERY_CADDY" > "$RECOVERY_DIR/images" || return 1
+  RECOVERY_UP=no
+  RECOVERY_ACTIVE=yes
+}
+
+finish_recovery() {
+  RECOVERY_ACTIVE=no
+  rm -rf "$RECOVERY_DIR"
+  RECOVERY_DIR=""
+}
+
+recover_stack() {
+  # 先关闭自动重试，避免 EXIT 再覆盖恢复失败现场。
+  RECOVERY_ACTIVE=no
+  if [[ ! -f $RECOVERY_DIR/compose.yaml ]]; then
+    ylw "首次安装失败，保留当前配置供排查；备份目录：$RECOVERY_DIR"
+    return 1
+  fi
+  ylw "正在恢复原配置和旧镜像…"
+  if [[ -f $RECOVERY_DIR/env ]]; then
+    cp -p "$RECOVERY_DIR/env" "$ENV_FILE" || return 1
+  else
+    rm -f "$ENV_FILE" || return 1
+  fi
+  cp -p "$RECOVERY_DIR/compose.yaml" "$COMPOSE_FILE" || return 1
+  load_env || return 1
+  if [[ $RECOVERY_UP == no ]]; then
+    if [[ $CADDY_STOPPED == yes ]]; then
+      compose start caddy || return 1
+      CADDY_STOPPED=no
+    fi
+    finish_recovery
+    return 0
+  fi
+  [[ -n $RECOVERY_V2 ]] || { red "找不到原 V2Ray 镜像 ID；备份：$RECOVERY_DIR"; return 1; }
+  docker tag "$RECOVERY_V2" v2fly/v2fly-core:rollback || return 1
+  V2FLY_TAG=rollback
+  if [[ $FRONT == caddy ]]; then
+    [[ -n $RECOVERY_CADDY ]] || { red "找不到原 Caddy 镜像 ID；备份：$RECOVERY_DIR"; return 1; }
+    docker tag "$RECOVERY_CADDY" caddy:rollback || return 1
+    CADDY_TAG=rollback
+  fi
+  save_env || return 1
+  compose up -d --force-recreate --remove-orphans --pull never || return 1
+  CADDY_STOPPED=no
+  wait_ready || return 1
+  grn "✓ 已恢复原配置和更新前镜像"
+  finish_recovery
+}
+
+fail_change() {
+  red "$1"
+  if ! recover_stack; then red "恢复未完成，备份保留在 $RECOVERY_DIR"; fi
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # 状态
@@ -97,8 +182,8 @@ load_env() {
 }
 
 save_env() {
-  mkdir -p "$STACK_DIR"
-  cat > "$ENV_FILE" <<EOF
+  mkdir -p "$STACK_DIR" || return 1
+  cat > "$ENV_FILE" <<EOF || return 1
 DOMAIN=$DOMAIN
 UUID=$UUID
 WS_PATH=$WS_PATH
@@ -107,7 +192,7 @@ FRONT=$FRONT
 V2FLY_TAG=$V2FLY_TAG
 CADDY_TAG=$CADDY_TAG
 EOF
-  chmod 600 "$ENV_FILE"
+  chmod 600 "$ENV_FILE" || return 1
 }
 
 container_running() { [[ -n "$(docker ps -q --filter "name=^$1\$" 2>/dev/null)" ]]; }
@@ -151,10 +236,25 @@ install_deps() {
 install_docker() {
   step "安装 Docker"
   if ! command -v docker >/dev/null; then
+    install -d -m 755 /etc/apt/sources.list.d
     curl -fsSL https://get.docker.com | sh
   fi
   systemctl enable --now docker >/dev/null 2>&1
-  docker compose version >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin >/dev/null
+  if ! docker compose version >/dev/null 2>&1; then
+    # 固定版本兼容 Docker 20.10，不更换已有 Docker；手动插件不会自动更新。
+    local arch dir asset version=2.24.7
+    case $(uname -m) in
+      x86_64|aarch64|armv7l|ppc64le|s390x) arch=$(uname -m) ;;
+      *) die "不支持此架构的 Compose 手动安装：$(uname -m)" ;;
+    esac
+    mktmp dir
+    asset="docker-compose-linux-$arch"
+    curl -fsSL "https://github.com/docker/compose/releases/download/v$version/$asset" -o "$dir/$asset"
+    curl -fsSL "https://github.com/docker/compose/releases/download/v$version/$asset.sha256" -o "$dir/checksum"
+    (cd "$dir" && sha256sum -c checksum) || die "Compose 校验失败，未安装"
+    install -d -m 755 /usr/local/lib/docker/cli-plugins
+    install -m 755 "$dir/$asset" /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
   local v
   v=$(docker compose version --short 2>/dev/null | sed 's/^v//' || true)
   [[ -n $v ]] || die "Docker Compose 安装失败"
@@ -218,7 +318,7 @@ check_domain() {
   如果占用的是宝塔面板或其他 Nginx，请重新运行安装，前端模式选「已有 Nginx」"
 
   token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  dir=$(mktmp)
+  mktmp dir || return 1
   mkdir -p "$dir/.well-known/v2ray-check"
   printf '%s' "$token" > "$dir/.well-known/v2ray-check/token"
   python3 -m http.server 80 --bind 0.0.0.0 --directory "$dir" >/dev/null 2>&1 &
@@ -312,7 +412,7 @@ prompt_config() {
 # Caddyfile、证书卷只在 caddy 模式写入。nginx 模式下 V2Ray 的 2333 端口发布到
 # 127.0.0.1，由宿主机上的 Nginx 反代，外网直接碰不到
 write_compose() {
-  mkdir -p "$STACK_DIR"
+  mkdir -p "$STACK_DIR" || return 1
   {
     cat <<'EOF'
 # 由 v2ray.sh 生成。域名、UUID、路径、前端模式、镜像版本读取同目录的 .env
@@ -391,7 +491,7 @@ volumes:
     name: caddy_config
 EOF
     fi
-  } > "$COMPOSE_FILE"
+  } > "$COMPOSE_FILE" || return 1
   compose config -q || die "compose.yaml 校验失败"
 }
 
@@ -473,7 +573,8 @@ e2e_ok() {
     server=caddy
     run_opts=(--network "$net")
   fi
-  dir=$(mktmp); chmod 755 "$dir"
+  mktmp dir || return 1
+  chmod 700 "$dir" || return 1
   cat > "$dir/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -491,20 +592,22 @@ e2e_ok() {
   }]
 }
 EOF
-  chmod 644 "$dir/config.json"
-  docker rm -f v2ray-e2e >/dev/null 2>&1 || true
-  docker run -d --name v2ray-e2e "${run_opts[@]}" -p 127.0.0.1::10808 \
+  chmod 600 "$dir/config.json" || return 1
+  E2E_CID_FILE="$dir/container.cid"
+  E2E_CID_FILES+=("$E2E_CID_FILE")
+  docker run -d --cidfile "$E2E_CID_FILE" --user 0:0 "${run_opts[@]}" -p 127.0.0.1::10808 \
     -v "$dir/config.json:/etc/v2ray/config.json:ro" \
     "v2fly/v2fly-core:$V2FLY_TAG" run -c /etc/v2ray/config.json >/dev/null 2>&1 || return 1
   sleep 3
-  hostport=$(docker port v2ray-e2e 10808/tcp 2>/dev/null | head -1 | sed 's/.*://')
+  hostport=$(docker port "$(cat "$E2E_CID_FILE")" 10808/tcp 2>/dev/null | head -1 | sed 's/.*://')
   if [[ -n $hostport ]]; then
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
       --socks5-hostname "127.0.0.1:$hostport" http://cp.cloudflare.com/generate_204 2>/dev/null || true)
     [[ $code != 204 ]] && code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
       --socks5-hostname "127.0.0.1:$hostport" http://www.gstatic.com/generate_204 2>/dev/null || true)
   fi
-  docker rm -f v2ray-e2e >/dev/null 2>&1 || true
+  docker rm -f "$(cat "$E2E_CID_FILE")" >/dev/null 2>&1 || true
+  E2E_CID_FILE=""
   [[ ${code:-} == 204 ]]
 }
 
@@ -703,6 +806,7 @@ cmd_install() {
   install_deps
   install_docker
   open_ufw
+  begin_recovery || return 1
 
   if [[ $FRONT == nginx ]]; then
     # 80/443 在 Nginx 手里，起不了临时网页服务，域名只能打印解析结果供人眼核对；
@@ -712,8 +816,8 @@ cmd_install() {
   else
     if container_running caddy && [[ $DOMAIN_CHANGED == yes ]]; then
       ylw "域名有变化，先停止 Caddy 以便检查新域名（脚本中途退出会自动恢复）"
-      compose stop caddy >/dev/null
       CADDY_STOPPED=yes
+      compose stop caddy >/dev/null || return 1
     fi
     if ! container_running caddy; then
       # 从 nginx 模式切回来、或者机器上本来就有别的 web 服务时，443 也可能被占着，
@@ -724,18 +828,22 @@ cmd_install() {
   fi
 
   step "写入配置并启动"
-  save_env
-  write_compose
-  pull_images
+  save_env || { fail_change "配置写入失败"; return 1; }
+  write_compose || { fail_change "容器配置写入失败"; return 1; }
+  if ! pull_images; then fail_change "拉取镜像失败"; return 1; fi
   # 配置内嵌在 compose.yaml 里，只改内容时 Compose 不会重建容器，
   # 会导致新 UUID / 路径不生效，所以这里强制重建。--remove-orphans 顺带处理
   # 模式切换：从 caddy 切到 nginx 时 compose.yaml 里没了 caddy 服务，旧容器会被删掉
-  compose up -d --force-recreate --remove-orphans
+  RECOVERY_UP=yes
+  if ! compose up -d --force-recreate --remove-orphans; then
+    fail_change "启动失败"; return 1
+  fi
   CADDY_STOPPED=no
 
   if [[ $FRONT == nginx ]]; then
     nginx_hint
     if ! confirm "宝塔 / Nginx 侧已经配置好，现在开始自检？" y; then
+      finish_recovery
       cmd_show
       echo
       ylw "配置好 Nginx 反代后，运行本脚本选「查看运行状态」即可自检。"
@@ -744,15 +852,10 @@ cmd_install() {
     fi
   fi
 
-  # 自检没过也要把配置打出来：容器此时已经在跑，链接可能本来就是能用的，
-  # 直接 die 掉等于让人白装一场
   if ! wait_ready; then
-    echo
-    ylw "自检未通过，但容器已经启动。下面是当前配置，可先自行验证；"
-    ylw "排查后重新运行本脚本即可，也可以用「查看运行状态」再测一次。"
-    cmd_show
-    exit 1
+    fail_change "安装自检未通过"; return 1
   fi
+  finish_recovery
 
   cmd_show
   echo
@@ -766,60 +869,25 @@ cmd_install() {
 # 照常 compose pull 会整个失败。安装 / 改配置不该顺手换版本，所以
 # 带 rollback 标签的服务跳过不拉，用本地已有的镜像
 pull_images() {
-  if [[ $V2FLY_TAG != rollback ]]; then compose pull -q v2ray; fi
-  if [[ $FRONT == caddy && $CADDY_TAG != rollback ]]; then compose pull -q caddy; fi
+  if [[ $V2FLY_TAG != rollback ]]; then compose pull -q v2ray || return 1; fi
+  if [[ $FRONT == caddy && $CADDY_TAG != rollback ]]; then compose pull -q caddy || return 1; fi
 }
 
 cmd_update() {
   preflight; need_docker
   [[ -f $COMPOSE_FILE ]] || die "还没有安装，请先运行「安装」"
   load_env
-  local old_v2 old_caddy
-  old_v2=$(docker inspect -f '{{.Image}}' v2ray 2>/dev/null || true)
-  old_caddy=$(docker inspect -f '{{.Image}}' caddy 2>/dev/null || true)
-
-  # 上次回退过的话标签停在 rollback。更新的意思就是再试一次最新版，
-  # 所以先把标签恢复成默认，否则 pull 会因为 Docker Hub 上没有这个标签而失败
+  begin_recovery || return 1
   if [[ $V2FLY_TAG == rollback ]]; then V2FLY_TAG=latest; fi
   if [[ $CADDY_TAG == rollback ]]; then CADDY_TAG=2; fi
-  save_env
-
+  save_env || { fail_change "配置写入失败"; return 1; }
   step "拉取最新镜像并重建容器"
-  compose pull -q
-  compose up -d --force-recreate --remove-orphans
-
-  if wait_ready; then
-    # 新版本没问题，再清掉旧镜像。先摘掉 rollback 标签，不然按 ID 删会因为
-    # 「被多个标签引用」失败。这些命令失败都无所谓（没新版本时新旧是同一个
-    # 镜像、正被容器占用，rmi 必然失败），所以不能用 && 串起来——set -e 下
-    # && 后面的命令失败照样会终止脚本，会在打完 ✓ 之后无声退出
-    docker rmi v2fly/v2fly-core:rollback caddy:rollback >/dev/null 2>&1 || true
-    if [[ -n $old_v2 ]]; then docker rmi "$old_v2" >/dev/null 2>&1 || true; fi
-    if [[ -n $old_caddy ]]; then docker rmi "$old_caddy" >/dev/null 2>&1 || true; fi
-    cmd_status
-    return 0
-  fi
-
-  red "新版本有问题"
-  if [[ -n $old_v2 || -n $old_caddy ]] && confirm "是否回退到更新前的版本？" y; then
-    if [[ -n $old_v2 ]]; then
-      docker tag "$old_v2" v2fly/v2fly-core:rollback || die "旧的 V2Ray 镜像已不存在，无法回退"
-      V2FLY_TAG=rollback
-    fi
-    if [[ -n $old_caddy ]]; then
-      docker tag "$old_caddy" caddy:rollback || die "旧的 Caddy 镜像已不存在，无法回退"
-      CADDY_TAG=rollback
-    fi
-    save_env; write_compose
-    compose up -d --force-recreate
-    if wait_ready; then
-      grn "✓ 已回退到更新前的版本。下次「更新」会再次尝试最新版"
-    else
-      red "回退后仍不正常，请查看日志"
-    fi
-  else
-    die "更新后服务未就绪"
-  fi
+  if ! compose pull -q; then fail_change "拉取新镜像失败"; return 1; fi
+  RECOVERY_UP=yes
+  if ! compose up -d --force-recreate --remove-orphans; then fail_change "重建失败"; return 1; fi
+  if ! wait_ready; then fail_change "新版本自检未通过"; return 1; fi
+  finish_recovery
+  cmd_status
 }
 
 cmd_status() {
