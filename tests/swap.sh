@@ -38,6 +38,34 @@ dd(){
   [[ $CASE != signal_pending ]] || kill -TERM $$
   [[ $CASE != signal_pending_int ]] || kill -INT $$
 }
+stat(){
+  [[ $1 == -c && $2 == '%d:%i' && $3 == -- && $4 == "$DIR"/* ]] || exit 99
+  python3 - "$4" <<'PY'
+import os,sys
+try:
+    info=os.lstat(sys.argv[1]); print(f'{info.st_dev}:{info.st_ino}')
+except FileNotFoundError: sys.exit(1)
+PY
+}
+rm(){
+  printf 'rm %s\n' "$*" >> "$LOG"
+  [[ $CASE != unlink_fail || $* != *swapfile.tmp.* ]] || return 1
+  python3 - "$DIR" "$TARGET" "$SWAPS" "$@" <<'PY'
+import os,pathlib,sys
+root,target,swaps,*args=sys.argv[1:]
+active=any(line.split()[0]==target for line in pathlib.Path(swaps).read_text().splitlines() if line.split())
+for path in [a for a in args if not a.startswith('-')]:
+    if os.path.commonpath([os.path.abspath(path),root]) != root: sys.exit(99)
+    if not os.path.lexists(path): continue
+    # 模拟 Linux：活动 Swap inode 的任何硬链接都不能 unlink。
+    if active and os.path.exists(target) and os.path.samestat(os.stat(path),os.stat(target)):
+        print('FORBIDDEN active unlink',file=sys.stderr); sys.exit(1)
+    os.unlink(path)
+PY
+  local result=$?
+  [[ $result == 0 ]] || return "$result"
+  if [[ $CASE == unlink_signal && $* == *swapfile.tmp.* ]]; then kill -TERM $$; fi
+}
 selinuxenabled(){ return 0; }
 chcon(){ printf 'chcon %s\n' "$*" >> "$LOG"; [[ $CASE != context_fail ]]; }
 ln(){
@@ -56,6 +84,15 @@ swapon(){
   printf 'swapon %s\n' "$*" >> "$LOG"
   [[ $1 == "$TARGET" ]] || exit 99
   [[ $CASE != enable_fail ]] || return 1
+  if [[ $CASE == target_replaced ]]; then
+    printf 'replacement user content' > "$DIR/replacement"
+    python3 - "$DIR/replacement" "$TARGET" <<'PY'
+import os,sys
+os.replace(sys.argv[1],sys.argv[2])
+PY
+    kill -TERM $$
+  fi
+  assert test "$(python3 -c 'import os,sys;print(os.stat(sys.argv[1]).st_nlink)' "$TARGET")" = 1
   printf '%s file 1048576 0 -2\n' "$TARGET" >> "$SWAPS"
   [[ $CASE != signal_active ]] || kill -TERM $$
 }
@@ -102,7 +139,7 @@ case "$CASE" in
     assert not_contains dd
     assert not_contains findmnt
     ;;
-  existing_file|symlink|directory|fstab_conflict|disk|unsupported|dd_fail|init_fail|enable_fail|backup_fail|candidate_fail|context_fail|persist_fail|reload_fail|signal_pending|signal_pending_int|signal_active|success)
+  existing_file|symlink|directory|fstab_conflict|disk|unsupported|dd_fail|init_fail|enable_fail|unlink_fail|unlink_signal|target_replaced|backup_fail|candidate_fail|context_fail|persist_fail|reload_fail|signal_pending|signal_pending_int|signal_active|success)
     confirm(){ printf 'confirm %s\n' "$*" >> "$LOG"; [[ $2 == n ]]; }
     case "$CASE" in
       existing_file) printf 'user content' > "$TARGET" ;;
@@ -123,7 +160,7 @@ case "$CASE" in
       python3 - "$LOG" <<'PY' || exit 1
 import pathlib,sys
 lines=pathlib.Path(sys.argv[1]).read_text().splitlines()
-positions=[next(i for i,s in enumerate(lines) if s.startswith(prefix)) for prefix in ['dd ','restorecon ','mkswap ','swapon ','mv ','systemctl ']]
+positions=[next(i for i,s in enumerate(lines) if s.startswith(prefix)) for prefix in ['dd ','restorecon ','mkswap ','rm ','swapon ','mv ','systemctl ']]
 assert positions==sorted(positions)
 PY
     else
@@ -137,11 +174,23 @@ PY
         existing_file) assert test "$(cat "$TARGET")" = 'user content' ;;
         symlink) assert test -L "$TARGET" ;;
         directory) assert test -d "$TARGET" ;;
+        unlink_fail) assert not_contains 'swapon '; assert test ! -e "$TARGET" ;;
         *) assert test ! -e "$TARGET" ;;
       esac
       if [[ $CASE != reload_fail ]]; then assert cmp -s "$FSTAB" "$DIR/expected"; fi
     fi
     assert not_contains FORBIDDEN
+    ;;
+  legacy_active)
+    SWAP_SOURCE="$DIR/swapfile.tmp.legacy"; SWAP_TARGET=$TARGET
+    printf 'legacy swap data' > "$SWAP_SOURCE"
+    ln -T -- "$SWAP_SOURCE" "$SWAP_TARGET" || exit 1
+    SWAP_CREATED_ID=$(stat -c '%d:%i' -- "$SWAP_SOURCE") || exit 1
+    printf '%s file 1048576 0 -2\n' "$TARGET" >> "$SWAPS"
+    cleanup_swap
+    assert test -f "$SWAP_SOURCE"
+    assert test -f "$TARGET"
+    assert not_contains 'rm '
     ;;
   *) exit 98 ;;
 esac
@@ -149,10 +198,13 @@ cleanup
 assert not_contains FORBIDDEN
 BASH
   case "$1" in
-    signal_pending|signal_pending_int)
+    signal_pending|signal_pending_int|unlink_signal)
       expected_status=143; [[ $1 != signal_pending_int ]] || expected_status=130
       [[ $status == "$expected_status" && ! -e "$ROOT/$1/swapfile" ]] || return 1
       [[ $(find "$ROOT/$1" -name 'swapfile.tmp.*' -print) == '' ]] || return 1
+      ;;
+    target_replaced)
+      [[ $status == 143 && $(cat "$ROOT/$1/swapfile") == 'replacement user content' ]] || return 1
       ;;
     signal_active)
       [[ $status == 143 && -f "$ROOT/$1/swapfile" && $(cat "$ROOT/$1/log") != *swapoff* ]] || return 1
@@ -161,6 +213,6 @@ BASH
   esac
   printf 'PASS %s\n' "$1"
 }
-for test in enough existing_swap decline success existing_file symlink directory fstab_conflict disk unsupported dd_fail init_fail enable_fail backup_fail candidate_fail context_fail persist_fail reload_fail signal_pending signal_pending_int signal_active; do
+for test in enough existing_swap decline success existing_file symlink directory fstab_conflict disk unsupported dd_fail init_fail enable_fail unlink_fail unlink_signal target_replaced legacy_active backup_fail candidate_fail context_fail persist_fail reload_fail signal_pending signal_pending_int signal_active; do
   run_case "$test" || { printf 'FAIL %s\n' "$test" >&2; exit 1; }
 done
