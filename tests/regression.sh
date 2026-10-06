@@ -11,12 +11,13 @@ run_case() {
   bash -s -- "$1" <<'BASH' || status=$?
 set -euo pipefail
 source "$SCRIPT"
+OS_FAMILY=debian
 STACK_DIR="$ROOT/$1"; mkdir -p "$STACK_DIR"
 ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
 LOG="$STACK_DIR/log"
 step(){ :; }; grn(){ :; }; ylw(){ :; }; red(){ :; }
 apt-get(){ printf 'FORBIDDEN apt-get %s\n' "$*" >> "$LOG"; return 1; }
-preflight(){ :; }; need_docker(){ :; }; install_deps(){ :; }; install_docker(){ :; }; open_ufw(){ :; }
+preflight(){ :; }; need_docker(){ :; }; install_deps(){ :; }; install_docker(){ :; }; open_ufw(){ :; }; open_firewall(){ :; }
 cmd_status(){ :; }; cmd_show(){ :; }; nginx_hint(){ :; }; show_dns(){ :; }
 sleep(){ :; }; port_in_use(){ return 1; }; confirm(){ return 0; }
 docker(){

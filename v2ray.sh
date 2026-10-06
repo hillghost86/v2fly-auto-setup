@@ -3,7 +3,7 @@
 # v2ray.sh — V2Fly v5 + Caddy 2（VMess + WebSocket + TLS）一键安装与管理
 #
 # 用法（在服务器上以 root 运行）:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v2ray.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v2ray.sh)
 #   curl -fsSL .../v2ray.sh | bash -s -- install
 #   支持的子命令: install | update | status | show | uninstall
 #
@@ -29,6 +29,7 @@ STACK_DIR=/root/v2ray-stack
 ENV_FILE="$STACK_DIR/.env"
 COMPOSE_FILE="$STACK_DIR/compose.yaml"
 MIN_COMPOSE=2.23.1
+OS_FAMILY=""
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -209,13 +210,49 @@ need_root() {
   请用: sudo -i 切到 root，或 curl -fsSL <脚本地址> | sudo bash -s -- ${1:-install}"
 }
 
+detect_os() {
+  local os_file=${1:-/etc/os-release} ID="" VERSION_ID="" NAME="" PRETTY_NAME=""
+  [[ -r $os_file ]] || die "无法读取系统版本：$os_file"
+  # shellcheck disable=SC1090
+  source "$os_file"
+  case "$ID" in
+    debian|ubuntu) OS_FAMILY=debian ;;
+    rocky|almalinux)
+      [[ ${VERSION_ID%%.*} == 9 ]] || die "仅支持 Rocky Linux / AlmaLinux 9"
+      OS_FAMILY=el9
+      ;;
+    centos)
+      [[ ${VERSION_ID%%.*} == 9 && ( $NAME == *"CentOS Stream"* || $PRETTY_NAME == *"CentOS Stream"* ) ]] \
+        || die "仅支持 CentOS Stream 9，不支持 CentOS Linux 或 Stream 8"
+      OS_FAMILY=el9
+      ;;
+    *) die "仅支持 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 和 CentOS Stream 9" ;;
+  esac
+}
+
 preflight() {
-  command -v apt-get >/dev/null || die "目前只支持 Debian / Ubuntu"
+  detect_os
   command -v systemctl >/dev/null || die "需要 systemd"
+  if [[ $OS_FAMILY == el9 ]]; then
+    command -v dnf >/dev/null || die "没有检测到 dnf"
+    command -v rpm >/dev/null || die "没有检测到 rpm"
+  else
+    command -v apt-get >/dev/null || die "没有检测到 apt-get"
+  fi
+}
+
+check_docker_engine() {
+  local version
+  version=$(docker --version 2>/dev/null) || die "Docker 命令无法运行"
+  if [[ $version == *[Pp][Oo][Dd][Mm][Aa][Nn]* ]] || \
+      { [[ $OS_FAMILY == el9 ]] && rpm -q podman-docker >/dev/null 2>&1; }; then
+    die "检测到 podman-docker / Podman 兼容命令，需要真正的 Docker Engine；请先自行处理冲突，本脚本不会卸载现有软件"
+  fi
 }
 
 need_docker() {
   command -v docker >/dev/null || die "没有检测到 Docker，请先运行本脚本的「安装」"
+  check_docker_engine
   docker compose version >/dev/null 2>&1 || die "没有检测到 Docker Compose，请先运行本脚本的「安装」"
   docker info >/dev/null 2>&1 || die "Docker 没有运行，请执行: systemctl start docker"
 }
@@ -223,12 +260,31 @@ need_docker() {
 install_deps() {
   step "安装基础依赖"
   local pkgs=() p
-  for p in curl ca-certificates qrencode openssl python3; do
-    dpkg -s "$p" &>/dev/null || pkgs+=("$p")
-  done
-  if ((${#pkgs[@]})); then
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null
+  if [[ $OS_FAMILY == el9 ]]; then
+    for p in curl ca-certificates openssl python3 iproute; do
+      if [[ $p == curl ]]; then
+        # EL9 最小安装常有 curl-minimal，所需的 HTTP(S) 功能已经齐全。
+        rpm -q curl &>/dev/null || rpm -q curl-minimal &>/dev/null || pkgs+=(curl)
+      else
+        rpm -q "$p" &>/dev/null || pkgs+=("$p")
+      fi
+    done
+    if ((${#pkgs[@]})); then
+      dnf install -y "${pkgs[@]}" || die "基础依赖安装失败"
+    fi
+    if ! command -v qrencode >/dev/null; then
+      if ! dnf install -y qrencode; then
+        ylw "当前软件源没有可用的 qrencode，跳过二维码；客户端链接仍可使用。本脚本不会添加 EPEL。"
+      fi
+    fi
+  else
+    for p in curl ca-certificates qrencode openssl python3; do
+      dpkg -s "$p" &>/dev/null || pkgs+=("$p")
+    done
+    if ((${#pkgs[@]})); then
+      apt-get update -qq || die "APT 更新失败"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null || die "基础依赖安装失败"
+    fi
   fi
   grn "✓ 依赖已就绪"
 }
@@ -236,10 +292,18 @@ install_deps() {
 install_docker() {
   step "安装 Docker"
   if ! command -v docker >/dev/null; then
-    install -d -m 755 /etc/apt/sources.list.d
-    curl -fsSL https://get.docker.com | sh
+    if [[ $OS_FAMILY == el9 ]]; then
+      dnf install -y dnf-plugins-core || die "Docker 软件源工具安装失败"
+      dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo || die "添加 Docker 官方软件源失败"
+      dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin \
+        || die "Docker 安装失败，请检查软件包冲突；本脚本不会卸载现有软件或使用 --allowerasing"
+    else
+      install -d -m 755 /etc/apt/sources.list.d || die "创建 APT 源目录失败"
+      curl -fsSL https://get.docker.com | sh || die "Docker 安装失败"
+    fi
   fi
-  systemctl enable --now docker >/dev/null 2>&1
+  check_docker_engine
+  systemctl enable --now docker >/dev/null 2>&1 || die "Docker 服务启动失败"
   if ! docker compose version >/dev/null 2>&1; then
     # 固定版本兼容 Docker 20.10，不更换已有 Docker；手动插件不会自动更新。
     local arch dir asset version=2.24.7
@@ -271,10 +335,35 @@ public_ip() {
 port_in_use() { [[ -n "$(ss -Htln "sport = :$1" 2>/dev/null)" ]]; }
 
 open_ufw() {
+  [[ $FRONT == caddy ]] || return 0
   if command -v ufw >/dev/null && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
+    ufw allow 80/tcp >/dev/null || return 1
+    ufw allow 443/tcp >/dev/null || return 1
     grn "✓ ufw 已放行 80、443"
   fi
+}
+
+# 只修改公网出口网卡实际使用的区域，不启动防火墙、不做全局 reload。
+open_firewall() {
+  [[ $FRONT == caddy ]] || return 0
+  open_ufw || die "ufw 规则添加失败"
+  [[ $OS_FAMILY == el9 ]] || return 0
+  command -v firewall-cmd >/dev/null || return 0
+  firewall-cmd --state >/dev/null 2>&1 || return 0
+  local interface zone port
+  interface=$(ip -4 route get 1.1.1.1 | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}') \
+    || die "无法确定公网出口网卡，请检查路由"
+  [[ -n $interface ]] || die "无法确定公网出口网卡，请检查路由"
+  zone=$(firewall-cmd --get-zone-of-interface="$interface" 2>/dev/null || true)
+  if [[ -z $zone || $zone == "no zone" ]]; then
+    zone=$(firewall-cmd --get-default-zone) || die "无法读取 firewalld 默认区域"
+  fi
+  [[ -n $zone ]] || die "无法确定 firewalld 区域"
+  for port in 80 443; do
+    firewall-cmd --zone="$zone" --add-port="$port/tcp" >/dev/null || die "firewalld 临时规则添加失败"
+    firewall-cmd --permanent --zone="$zone" --add-port="$port/tcp" >/dev/null || die "firewalld 永久规则添加失败"
+  done
+  grn "✓ firewalld 已在网卡 $interface 的 $zone 区域放行 80、443"
 }
 
 # ---------------------------------------------------------------------------
@@ -408,6 +497,8 @@ prompt_config() {
   confirm "确认以上配置？" y || exit 1
 }
 
+# Compose 2.24.7 的 inline configs 通过 CopyToContainer 注入，不是宿主 bind，
+# 保留容器默认 SELinux 隔离；只有 e2e 的独占临时 bind 文件使用 :Z 重标记。
 # compose.yaml 按模式拼装：V2Ray 服务和它的配置两种模式都有；Caddy 服务、
 # Caddyfile、证书卷只在 caddy 模式写入。nginx 模式下 V2Ray 的 2333 端口发布到
 # 127.0.0.1，由宿主机上的 Nginx 反代，外网直接碰不到
@@ -596,7 +687,7 @@ EOF
   E2E_CID_FILE="$dir/container.cid"
   E2E_CID_FILES+=("$E2E_CID_FILE")
   docker run -d --cidfile "$E2E_CID_FILE" --user 0:0 "${run_opts[@]}" -p 127.0.0.1::10808 \
-    -v "$dir/config.json:/etc/v2ray/config.json:ro" \
+    -v "$dir/config.json:/etc/v2ray/config.json:ro,Z" \
     "v2fly/v2fly-core:$V2FLY_TAG" run -c /etc/v2ray/config.json >/dev/null 2>&1 || return 1
   sleep 3
   hostport=$(docker port "$(cat "$E2E_CID_FILE")" 10808/tcp 2>/dev/null | head -1 | sed 's/.*://')
@@ -805,7 +896,7 @@ cmd_install() {
   prompt_config
   install_deps
   install_docker
-  open_ufw
+  open_firewall
   begin_recovery || return 1
 
   if [[ $FRONT == nginx ]]; then
