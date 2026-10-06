@@ -2,7 +2,7 @@
 
 ## 范围与结构
 
-- 本项目是 Debian / Ubuntu 上的 V2Fly + Caddy 安装管理脚本，支持已有 Nginx 的部署方式。
+- 本项目是 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 和 CentOS Stream 9 上的 V2Fly + Caddy 安装管理脚本，支持已有 Nginx 的部署方式。
 - `v2ray.sh` 是 Bash 入口；`README.md` 记录服务器使用方法。
 - 运行配置位于服务器的 `/root/v2ray-stack`；不要把真实 UUID、域名配置或证书带入仓库。
 
@@ -10,9 +10,9 @@
 
 - 在独立特性分支修改；默认远程分支为 `main`。
 - 基础语法检查：`bash -n v2ray.sh`。
-- 模拟回归检查：`bash tests/regression.sh`，无需 Docker 服务或额外测试框架。
-- 本地验证使用模拟的 Docker、APT 和网络命令，不能直接运行脚本的安装、更新或卸载子命令。
-- 模拟检查不能代替 Debian / Ubuntu 上的真实部署验证，交付时明确未验证范围。
+- 模拟回归检查：`bash tests/regression.sh` 和 `bash tests/el9.sh`，无需 Docker 服务或额外测试框架。
+- 本地验证使用模拟的 Docker、APT、DNF、防火墙和网络命令，不能直接运行脚本的安装、更新或卸载子命令。
+- 模拟检查不能代替 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 和 CentOS Stream 9 上的真实部署验证，交付时明确未验证范围。
 - 安装依赖、真实容器操作及服务器部署需另行获得用户授权。
 
 ## 恢复与资源归属

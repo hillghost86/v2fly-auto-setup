@@ -1,6 +1,6 @@
 # v2ray.sh
 
-一个脚本在 Debian / Ubuntu 服务器上装好 **V2Fly v5 + Caddy 2**，用 **VMess + WebSocket + TLS** 组合，证书自动申请、自动续期。装完直接给出客户端链接和二维码。
+一个脚本在 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 或 CentOS Stream 9 服务器上装好 **V2Fly v5 + Caddy 2**，用 **VMess + WebSocket + TLS** 组合，证书自动申请、自动续期。装完直接给出客户端链接和二维码。
 
 全部跑在 Docker 里，不往系统里装 V2Ray 或 Nginx，卸载干净。
 
@@ -8,26 +8,32 @@
 
 ## 需要准备
 
-- 一台 Debian / Ubuntu 服务器（需要 systemd，root 权限）
+- 一台 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 或 CentOS Stream 9 服务器（需要 systemd，root 权限）
 - 一个域名，A 记录指向服务器公网 IP
 - 服务器防火墙放行 **TCP 80 和 443**（80 用来申请证书，不能省）
 
-Docker、Docker Compose、qrencode 这些依赖脚本会自己装。
+Docker、Docker Compose 和基础依赖由脚本安装。EL9 系列的二维码工具 `qrencode` 为可选依赖，当前软件源不提供时会跳过二维码，客户端链接仍可正常输出。
 
-已有 Docker 时不会替换 Docker 引擎。缺少 Compose 时，脚本会从 Docker 官方 GitHub 发布页下载固定版本 [v2.24.7](https://github.com/docker/compose/releases/tag/v2.24.7) 的独立插件，并校验 SHA-256；这种安装方式不会通过 APT 自动更新。新装 Docker 前会补齐 APT 软件源目录，兼容缺少该目录的精简系统。
+已有 Docker 时不会替换 Docker 引擎。缺少 Compose 时，脚本会从 Docker 官方 GitHub 发布页下载固定版本 [v2.24.7](https://github.com/docker/compose/releases/tag/v2.24.7) 的独立插件，并校验 SHA-256；这种安装方式不会通过系统包管理器自动更新。新装 Docker 前会补齐 APT 软件源目录，兼容缺少该目录的精简系统。
+
+EL9 首次安装 Docker 使用 Docker 官方 CentOS RPM 软件源；已有 Docker 时保留引擎。遇到 Podman 提供的兼容 `docker` 命令或软件包冲突会停止并给出提示，不自动卸载现有软件。
+
+Caddy 模式会为公网出口网卡所在的活动 firewalld 区域开放 TCP 80/443，同时写入运行时和永久规则；不会启动未运行的 firewalld。已有 Nginx 模式不修改防火墙规则。SELinux 保持开启，连接测试的临时挂载使用独占标签。云厂商安全组仍需自行放行。已有 Nginx 的 SELinux 反向代理策略由站点管理员配置，脚本不会修改全局 SELinux 布尔开关。
+
+CentOS Linux 8、CentOS Stream 8、RHEL 及其他发行版暂不在新增支持范围。
 
 ## 使用
 
-所有子命令都要 root（配置在 `/root/v2ray-stack` 下，还要动 Docker、apt、systemd 和 80/443 端口）。先 `sudo -i` 切到 root，然后：
+所有子命令都要 root（配置在 `/root/v2ray-stack` 下，还要动 Docker、包管理器、systemd 和 80/443 端口）。先 `sudo -i` 切到 root，然后：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v2ray.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v2ray.sh)
 ```
 
 不想切 root 就用管道加 `sudo`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v2ray.sh | sudo bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v2ray.sh | sudo bash -s -- install
 ```
 
 > 唯独 `sudo bash <(curl ...)` **不能用**。进程替换的 `/dev/fd/63` 是调用者进程的管道，而 sudo 默认 `closefrom=3` 会关掉 3 号以上所有文件描述符，新进程再去打开它只会得到 `No such file or directory`。要么用上面的管道写法，要么下载到本地再 `sudo bash v2ray.sh`。
@@ -196,6 +202,7 @@ docker logs --tail 50 v2ray
 ```bash
 bash -n v2ray.sh
 bash tests/regression.sh
+bash tests/el9.sh
 ```
 
 回归测试需要 Bash 和 Python 3，使用模拟命令检查安装分支、资源清理和失败恢复，不下载依赖、不操作真实 Docker 或系统配置。它不能代替服务器上的实际部署验证。
