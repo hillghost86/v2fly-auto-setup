@@ -2,7 +2,7 @@
 # 仅模拟 OS、包管理、Docker、防火墙；所有外部写操作均由 mock 拦截。
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
-SCRIPT="$PWD/v2ray.sh"
+SCRIPT="$PWD/v2fly-auto-setup.sh"
 ROOT=$(mktemp -d) || exit 1
 trap 'rm -rf "$ROOT"' EXIT
 export SCRIPT ROOT
@@ -16,6 +16,7 @@ LOG="$ROOT/$CASE.log"; : > "$LOG"
 OS_FAMILY=el9; FRONT=caddy
 HAVE_DOCKER=yes; HAVE_QR=yes; HAVE_UFW=no; HAVE_FIREWALL=yes
 HAVE_COMPOSE=yes
+QR_ATTEMPTS=0
 PODMAN=no; MISSING=''; FIREWALL_RUNNING=yes; INTERFACE_ZONE=external
 step(){ :; }; grn(){ :; }; ylw(){ printf 'warning %s\n' "$*" >> "$LOG"; }
 assert(){ "$@" || { printf 'assert failed: %s\n' "$*" >&2; exit 1; }; }
@@ -28,6 +29,8 @@ command(){
       qrencode) [[ $HAVE_QR == yes ]] ;;
       ufw) [[ $HAVE_UFW == yes ]] ;;
       firewall-cmd) [[ $HAVE_FIREWALL == yes ]] ;;
+      curl|openssl|python3|ss|ip)
+        [[ $CASE != deps_missing_command || $2 != ss ]] ;;
       systemctl|dnf|rpm|apt-get) return 0 ;;
       *) builtin command "$@" ;;
     esac
@@ -35,14 +38,21 @@ command(){
 }
 rpm(){
   printf 'rpm %s\n' "$*" >> "$LOG"
-  if [[ $2 == podman-docker ]]; then [[ $PODMAN == yes ]]; else [[ " $MISSING " != *" $2 "* ]]; fi
+  if [[ $2 == epel-release ]]; then [[ $CASE == epel_existing ]];
+  elif [[ $2 == podman-docker ]]; then [[ $PODMAN == yes ]]; else [[ " $MISSING " != *" $2 "* ]]; fi
 }
 dnf(){
   printf 'dnf %s\n' "$*" >> "$LOG"
   if [[ $CASE == deps_failure && $* == 'install -y curl '* ]]; then return 1; fi
-  if [[ $* == 'install -y qrencode' && $CASE == deps_optional ]]; then return 1; fi
+  if [[ $* == 'install -y qrencode' ]]; then
+    QR_ATTEMPTS=$((QR_ATTEMPTS+1))
+    if [[ $CASE == deps_optional || $CASE == epel_tool_fail ]]; then return 1; fi
+    if [[ $CASE == epel_* && $QR_ATTEMPTS == 1 ]]; then return 1; fi
+  fi
+  if [[ $CASE == epel_repo_fail && $* == *epel-release-latest-9.noarch.rpm* ]]; then return 1; fi
   if [[ $* == 'install -y docker-ce '* && $CASE == docker_conflict ]]; then return 1; fi
   if [[ $* == *docker-ce* ]]; then HAVE_DOCKER=yes; fi
+  if [[ $* == 'install -y curl '* && $CASE != deps_missing_package ]]; then MISSING=''; fi
   return 0
 }
 apt-get(){ printf 'FORBIDDEN apt-get\n' >> "$LOG"; exit 99; }
@@ -68,6 +78,7 @@ docker(){
   case "$*" in
     --version) if [[ $PODMAN == yes ]]; then echo 'podman version 4.9.4'; else echo 'Docker version 20.10.24'; fi ;;
     'compose version --short') echo 2.24.7 ;;
+    info) [[ $CASE != docker_unready ]] ;;
     'compose version') [[ $HAVE_COMPOSE == yes ]]  ;;
     run*)
       local previous='' argument
@@ -99,6 +110,10 @@ ufw(){
 }
 sleep(){ :; }
 setenforce(){ exit 99; }
+confirm(){
+  printf 'confirm %s\n' "$*" >> "$LOG"
+  [[ $2 == n && ( $CASE == epel_agree || $CASE == epel_repo_fail || $CASE == epel_tool_fail ) ]]
+}
 case "$CASE" in
   os_*)
     os_file="$ROOT/$CASE.os"
@@ -123,21 +138,44 @@ case "$CASE" in
       *) assert test "$OS_FAMILY" = el9 ;;
     esac
     ;;
-  deps_missing|deps_optional|deps_minimal|deps_failure)
+  deps_missing|deps_optional|deps_minimal|deps_failure|deps_missing_command|deps_missing_package|deps_qr_missing)
     if [[ $CASE == deps_minimal ]]; then MISSING=curl;
     else MISSING='curl curl-minimal ca-certificates openssl python3 iproute'; fi
-    [[ $CASE != deps_optional ]] || HAVE_QR=no
+    [[ $CASE != deps_optional && $CASE != deps_qr_missing ]] || HAVE_QR=no
     install_deps || exit 1
     if [[ $CASE == deps_minimal ]]; then assert not_contains 'dnf install -y curl';
     else assert contains 'dnf install -y curl ca-certificates openssl python3 iproute'; fi
     if [[ $CASE == deps_optional ]]; then
       assert contains 'dnf install -y qrencode'
       assert contains '跳过二维码'
+      assert contains 'confirm '
+      assert not_contains epel-release-latest-9.noarch.rpm
     fi
+    if [[ $CASE == deps_qr_missing ]]; then assert contains 'qrencode 不可用'; assert not_contains 'confirm '; fi
     assert not_contains EPEL-release
     assert not_contains FORBIDDEN
     ;;
-  docker_existing|docker_new|docker_podman|docker_conflict|docker_plugin)
+  epel_agree|epel_existing|epel_repo_fail|epel_tool_fail|epel_installed)
+    HAVE_QR=no
+    [[ $CASE != epel_installed ]] || HAVE_QR=yes
+    install_qrencode_el9 || exit 1
+    case "$CASE" in
+      epel_installed) assert test ! -s "$LOG" ;;
+      epel_existing) assert not_contains 'confirm '; assert not_contains epel-release-latest-9.noarch.rpm; assert test "$QR_ATTEMPTS" = 2 ;;
+      *)
+        assert contains 'confirm '
+        assert contains '外部软件源'
+        assert contains 'dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm'
+        if [[ $CASE == epel_repo_fail ]]; then assert test "$QR_ATTEMPTS" = 1; assert contains 'EPEL 软件源安装失败';
+        elif [[ $CASE == epel_tool_fail ]]; then assert contains 'qrencode 仍无法安装';
+        else assert test "$QR_ATTEMPTS" = 2; fi
+        ;;
+    esac
+    assert not_contains nogpgcheck
+    assert not_contains crb
+    assert not_contains epel-next
+    ;;
+  docker_existing|docker_new|docker_podman|docker_conflict|docker_plugin|docker_unready)
     [[ $CASE != docker_new && $CASE != docker_conflict ]] || HAVE_DOCKER=no
     [[ $CASE != docker_podman ]] || PODMAN=yes
     [[ $CASE != docker_plugin ]] || HAVE_COMPOSE=no
@@ -192,7 +230,7 @@ case "$CASE" in
 esac
 BASH
   case "$1" in
-    os_reject_*|docker_podman|docker_conflict|deps_failure|firewall_ufw_failure) [[ $status == 1 ]] || return 1 ;;
+    os_reject_*|docker_podman|docker_conflict|docker_unready|deps_failure|deps_missing_command|deps_missing_package|firewall_ufw_failure) [[ $status == 1 ]] || return 1 ;;
     *) [[ $status == 0 ]] || return 1 ;;
   esac
   if [[ $1 == docker_podman ]]; then
@@ -206,6 +244,6 @@ BASH
   fi
   printf 'PASS %s\n' "$1"
 }
-for test in os_debian os_ubuntu os_rocky9 os_alma9 os_stream9 os_reject_rocky8 os_reject_alma8 os_reject_stream8 os_reject_centoslinux9 os_reject_centoslinux8 os_reject_rhel9 os_reject_fedora deps_missing deps_optional deps_minimal deps_failure docker_existing docker_new docker_podman docker_conflict docker_plugin firewall_zone firewall_default firewall_inactive firewall_nginx firewall_ufw firewall_ufw_failure firewall_absent selinux; do
+for test in os_debian os_ubuntu os_rocky9 os_alma9 os_stream9 os_reject_rocky8 os_reject_alma8 os_reject_stream8 os_reject_centoslinux9 os_reject_centoslinux8 os_reject_rhel9 os_reject_fedora deps_missing deps_optional deps_minimal deps_failure deps_missing_command deps_missing_package deps_qr_missing epel_agree epel_existing epel_repo_fail epel_tool_fail epel_installed docker_existing docker_new docker_podman docker_conflict docker_plugin docker_unready firewall_zone firewall_default firewall_inactive firewall_nginx firewall_ufw firewall_ufw_failure firewall_absent selinux; do
   run_case "$test" || { printf 'FAIL %s\n' "$test" >&2; exit 1; }
 done
