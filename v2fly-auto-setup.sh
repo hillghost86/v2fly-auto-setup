@@ -67,7 +67,7 @@ RECOVERY_DIR=""
 RECOVERY_ACTIVE=no
 RECOVERY_UP=no
 RECOVERY_V2="" RECOVERY_CADDY=""
-SWAP_SOURCE="" SWAP_TARGET="" SWAP_ACTIVE=no SWAP_PERSISTED=no
+SWAP_SOURCE="" SWAP_TARGET="" SWAP_CREATED_ID="" SWAP_ACTIVE=no SWAP_PERSISTED=no
 SWAP_STATUS_FILE=/proc/swaps
 SWAP_FSTAB_CANDIDATE="" SWAP_FSTAB_BACKUP=""
 
@@ -272,16 +272,24 @@ swap_is_active() {
 }
 
 cleanup_swap() {
-  local active_status
-  if [[ -n $SWAP_SOURCE ]]; then
-    if [[ $SWAP_ACTIVE == no && -n $SWAP_TARGET && $SWAP_TARGET -ef $SWAP_SOURCE ]]; then
-      # swapon 已完成但还未来得及设置标志时，信号清理也必须保留文件。
-      if swap_is_active "$SWAP_TARGET" "$SWAP_STATUS_FILE"; then active_status=0; else active_status=$?; fi
-      if [[ $active_status == 1 ]]; then rm -f -- "$SWAP_TARGET";
-      elif [[ $active_status == 0 ]]; then SWAP_ACTIVE=yes; fi
+  local active_status=1 target_id=""
+  if [[ $SWAP_ACTIVE == yes ]]; then
+    active_status=0
+  elif [[ -n $SWAP_TARGET ]]; then
+    # swapon 已完成但尚未设置标志时，仍以实际活动状态保护整个 inode。
+    if swap_is_active "$SWAP_TARGET" "$SWAP_STATUS_FILE"; then active_status=0; else active_status=$?; fi
+  fi
+  if [[ $active_status == 0 ]]; then
+    SWAP_ACTIVE=yes
+    # Linux 禁止 unlink 活动 Swap 的任何硬链接；旧失败现场的 source 也保留。
+  elif [[ $active_status == 1 ]]; then
+    if [[ -n $SWAP_TARGET && -n $SWAP_CREATED_ID && ! -L $SWAP_TARGET ]]; then
+      target_id=$(stat -c '%d:%i' -- "$SWAP_TARGET" 2>/dev/null || true)
+      [[ $target_id != "$SWAP_CREATED_ID" ]] || rm -f -- "$SWAP_TARGET"
     fi
-    rm -f -- "$SWAP_SOURCE"
-    SWAP_SOURCE=""
+    if [[ -n $SWAP_SOURCE ]]; then
+      rm -f -- "$SWAP_SOURCE" && SWAP_SOURCE=""
+    fi
   fi
   [[ -z $SWAP_FSTAB_CANDIDATE ]] || rm -f -- "$SWAP_FSTAB_CANDIDATE"
   SWAP_FSTAB_CANDIDATE=""
@@ -295,7 +303,7 @@ create_swap() {
   local swap_file=${1:-/swapfile} fstab_file=${2:-/etc/fstab} parent fs available entry rest tool
   [[ ! -e $swap_file && ! -L $swap_file ]] || { red "$swap_file 已存在，不会覆盖；请自行检查 Swap"; return 1; }
   [[ -f $fstab_file && ! -L $fstab_file ]] || { red "$fstab_file 不是普通文件，停止创建 Swap"; return 1; }
-  for tool in findmnt df dd mkswap swapon mktemp cp chmod ln mv cmp awk systemctl; do
+  for tool in findmnt df dd mkswap swapon mktemp cp chmod ln mv cmp awk stat systemctl; do
     command -v "$tool" >/dev/null || { red "缺少 $tool，无法安全创建 Swap；请自行准备，不会自动安装工具"; return 1; }
   done
   while read -r entry rest || [[ -n $entry ]]; do
@@ -312,6 +320,8 @@ create_swap() {
   SWAP_SOURCE=$(mktemp "$swap_file.tmp.XXXXXX") || return 1
   chmod 600 "$SWAP_SOURCE" || return 1
   dd if=/dev/zero of="$SWAP_SOURCE" bs=1M count=1024 conv=fsync || { red "Swap 文件写入失败；fstab 备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  SWAP_CREATED_ID=$(stat -c '%d:%i' -- "$SWAP_SOURCE") || return 1
+  [[ $SWAP_CREATED_ID =~ ^[0-9]+:[0-9]+$ ]] || return 1
   # ln 不覆盖任何已有路径，包括检测之后才出现的文件/符号链接。
   SWAP_TARGET=$swap_file
   ln -T -- "$SWAP_SOURCE" "$SWAP_TARGET" || { red "Swap 路径已占用，停止创建"; return 1; }
@@ -319,13 +329,13 @@ create_swap() {
     restorecon "$SWAP_TARGET" || { red "Swap 的 SELinux 标签恢复失败"; return 1; }
   fi
   mkswap "$SWAP_TARGET" || { red "Swap 初始化失败；fstab 备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  # 必须在启用前删去临时硬链接；Linux 不允许 unlink 活动 Swap inode。
+  rm -f -- "$SWAP_SOURCE" || { red "临时链接清理失败，未启用 Swap；fstab 备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  SWAP_SOURCE=""
   swapon "$SWAP_TARGET" || { red "Swap 启用失败；fstab 备份：$SWAP_FSTAB_BACKUP"; return 1; }
   SWAP_ACTIVE=yes
   # swapon 返回成功后保留文件，后续失败不能通过 swapoff 增加内存压力。
   swap_is_active "$SWAP_TARGET" "$SWAP_STATUS_FILE" || { red "无法确认 Swap 状态，请检查 $SWAP_TARGET；文件保留"; return 1; }
-  rm -f -- "$SWAP_SOURCE" || return 1
-  SWAP_SOURCE=""
-
   SWAP_FSTAB_CANDIDATE=$(mktemp "$fstab_file.v2fly-new.XXXXXX") || return 1
   cp --preserve=all -- "$fstab_file" "$SWAP_FSTAB_CANDIDATE" || { red "fstab 候选文件准备失败；备份：$SWAP_FSTAB_BACKUP"; return 1; }
   if command -v selinuxenabled >/dev/null && selinuxenabled; then
