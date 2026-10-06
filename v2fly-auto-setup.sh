@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# v2ray.sh — V2Fly v5 + Caddy 2（VMess + WebSocket + TLS）一键安装与管理
+# v2fly-auto-setup.sh — V2Fly v5 + Caddy 2（VMess + WebSocket + TLS）一键安装与管理
 #
 # 用法（在服务器上以 root 运行）:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v2ray.sh)
-#   curl -fsSL .../v2ray.sh | bash -s -- install
+#   bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v2fly-auto-setup.sh)
+#   curl -fsSL .../v2fly-auto-setup.sh | bash -s -- install
 #   支持的子命令: install | update | status | show | uninstall
 #
 # 两种前端模式（安装时选择，存在 .env 的 FRONT 里）:
@@ -67,11 +67,15 @@ RECOVERY_DIR=""
 RECOVERY_ACTIVE=no
 RECOVERY_UP=no
 RECOVERY_V2="" RECOVERY_CADDY=""
+SWAP_SOURCE="" SWAP_TARGET="" SWAP_ACTIVE=no SWAP_PERSISTED=no
+SWAP_STATUS_FILE=/proc/swaps
+SWAP_FSTAB_CANDIDATE="" SWAP_FSTAB_BACKUP=""
 
 cleanup() {
   # 清理不能因为某一步失败就中断：docker rm 在容器本来就不存在时会返回非 0，
   # 若保留 set -e，后面「恢复 Caddy」就被跳过了，服务会一直停着
   set +e
+  cleanup_swap
   [[ -n $CHECK_PID ]] && kill "$CHECK_PID" 2>/dev/null
   if [[ $RECOVERY_ACTIVE == yes ]]; then
     recover_stack || red "恢复失败，备份保留在 $RECOVERY_DIR"
@@ -257,6 +261,126 @@ need_docker() {
   docker info >/dev/null 2>&1 || die "Docker 没有运行，请执行: systemctl start docker"
 }
 
+# Swap 的文件归属用本次临时文件的 inode 判断；已启用的文件绝不删除。
+swap_is_active() {
+  local target=$1 swaps_file=${2:-/proc/swaps} entry rest
+  [[ -r $swaps_file ]] || return 2
+  while read -r entry rest; do
+    [[ $entry != "$target" ]] || return 0
+  done < "$swaps_file"
+  return 1
+}
+
+cleanup_swap() {
+  local active_status
+  if [[ -n $SWAP_SOURCE ]]; then
+    if [[ $SWAP_ACTIVE == no && -n $SWAP_TARGET && $SWAP_TARGET -ef $SWAP_SOURCE ]]; then
+      # swapon 已完成但还未来得及设置标志时，信号清理也必须保留文件。
+      if swap_is_active "$SWAP_TARGET" "$SWAP_STATUS_FILE"; then active_status=0; else active_status=$?; fi
+      if [[ $active_status == 1 ]]; then rm -f -- "$SWAP_TARGET";
+      elif [[ $active_status == 0 ]]; then SWAP_ACTIVE=yes; fi
+    fi
+    rm -f -- "$SWAP_SOURCE"
+    SWAP_SOURCE=""
+  fi
+  [[ -z $SWAP_FSTAB_CANDIDATE ]] || rm -f -- "$SWAP_FSTAB_CANDIDATE"
+  SWAP_FSTAB_CANDIDATE=""
+  if [[ $SWAP_ACTIVE == yes && $SWAP_PERSISTED == no ]]; then
+    ylw "Swap 已启用并保留，但重启自动启用可能未完成；请核对 fstab。备份：$SWAP_FSTAB_BACKUP"
+  fi
+}
+
+create_swap() {
+  # 参数仅用于本地 fixture 测试；安装入口使用固定 /swapfile 与 /etc/fstab。
+  local swap_file=${1:-/swapfile} fstab_file=${2:-/etc/fstab} parent fs available entry rest tool
+  [[ ! -e $swap_file && ! -L $swap_file ]] || { red "$swap_file 已存在，不会覆盖；请自行检查 Swap"; return 1; }
+  [[ -f $fstab_file && ! -L $fstab_file ]] || { red "$fstab_file 不是普通文件，停止创建 Swap"; return 1; }
+  for tool in findmnt df dd mkswap swapon mktemp cp chmod ln mv cmp awk systemctl; do
+    command -v "$tool" >/dev/null || { red "缺少 $tool，无法安全创建 Swap；请自行准备，不会自动安装工具"; return 1; }
+  done
+  while read -r entry rest || [[ -n $entry ]]; do
+    [[ $entry != "$swap_file" ]] || { red "$fstab_file 已有 $swap_file 条目，请先自行核对"; return 1; }
+  done < "$fstab_file"
+  parent=${swap_file%/*}; parent=${parent:-/}
+  fs=$(findmnt -n -o FSTYPE -T "$parent") || { red "无法确定 Swap 所在文件系统"; return 1; }
+  [[ $fs == ext4 || $fs == xfs ]] || { red "自动创建 Swap 仅支持 ext4 / xfs，当前为 $fs"; return 1; }
+  available=$(df -Pk "$parent" | awk 'NR==2 {print $4}') || return 1
+  [[ $available =~ ^[0-9]+$ ]] && (( available >= 2097152 )) || { red "磁盘至少需要 2 GiB 可用空间（Swap 1 GiB，另留 1 GiB）"; return 1; }
+
+  SWAP_FSTAB_BACKUP=$(mktemp "$fstab_file.v2fly-backup.XXXXXX") || return 1
+  cp -- "$fstab_file" "$SWAP_FSTAB_BACKUP" || { red "fstab 备份失败：$SWAP_FSTAB_BACKUP"; return 1; }
+  SWAP_SOURCE=$(mktemp "$swap_file.tmp.XXXXXX") || return 1
+  chmod 600 "$SWAP_SOURCE" || return 1
+  dd if=/dev/zero of="$SWAP_SOURCE" bs=1M count=1024 conv=fsync || { red "Swap 文件写入失败；fstab 备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  # ln 不覆盖任何已有路径，包括检测之后才出现的文件/符号链接。
+  SWAP_TARGET=$swap_file
+  ln -T -- "$SWAP_SOURCE" "$SWAP_TARGET" || { red "Swap 路径已占用，停止创建"; return 1; }
+  if command -v restorecon >/dev/null; then
+    restorecon "$SWAP_TARGET" || { red "Swap 的 SELinux 标签恢复失败"; return 1; }
+  fi
+  mkswap "$SWAP_TARGET" || { red "Swap 初始化失败；fstab 备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  swapon "$SWAP_TARGET" || { red "Swap 启用失败；fstab 备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  SWAP_ACTIVE=yes
+  # swapon 返回成功后保留文件，后续失败不能通过 swapoff 增加内存压力。
+  swap_is_active "$SWAP_TARGET" "$SWAP_STATUS_FILE" || { red "无法确认 Swap 状态，请检查 $SWAP_TARGET；文件保留"; return 1; }
+  rm -f -- "$SWAP_SOURCE" || return 1
+  SWAP_SOURCE=""
+
+  SWAP_FSTAB_CANDIDATE=$(mktemp "$fstab_file.v2fly-new.XXXXXX") || return 1
+  cp --preserve=all -- "$fstab_file" "$SWAP_FSTAB_CANDIDATE" || { red "fstab 候选文件准备失败；备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  if command -v selinuxenabled >/dev/null && selinuxenabled; then
+    chcon --reference="$fstab_file" "$SWAP_FSTAB_CANDIDATE" || { red "fstab 的 SELinux 标签复制失败；备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  fi
+  printf '\n%s none swap defaults,nofail 0 0\n' "$swap_file" >> "$SWAP_FSTAB_CANDIDATE" || return 1
+  cmp -s -- "$fstab_file" "$SWAP_FSTAB_BACKUP" || { red "fstab 已被其他操作修改，不覆盖；备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  mv -T -- "$SWAP_FSTAB_CANDIDATE" "$fstab_file" || { red "fstab 写入失败；Swap 已启用，备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  SWAP_FSTAB_CANDIDATE=""
+  SWAP_PERSISTED=yes
+  systemctl daemon-reload || { red "Swap 已启用，但 systemd 配置重载失败；请核对 fstab；备份：$SWAP_FSTAB_BACKUP"; return 1; }
+  grn "✓ 1 GiB Swap 已启用，并写入 fstab；备份：$SWAP_FSTAB_BACKUP"
+}
+
+prepare_low_memory() {
+  local mem_file=${1:-/proc/meminfo} swaps_file=${2:-/proc/swaps} key value rest total="" entry
+  [[ -r $mem_file && -r $swaps_file ]] || { red "无法读取内存 / Swap 状态，停止安装"; return 1; }
+  while read -r key value rest; do
+    if [[ $key == MemTotal: ]]; then total=$value; break; fi
+  done < "$mem_file"
+  [[ $total =~ ^[0-9]+$ ]] && (( total > 0 )) || { red "无法确定物理内存大小，停止安装"; return 1; }
+  (( total < 1048576 )) || return 0
+  while read -r entry rest; do
+    [[ -z $entry || $entry == Filename ]] || return 0
+  done < "$swaps_file"
+  ylw "物理内存不足 1 GiB 且没有活动 Swap，安装依赖可能耗尽内存并导致 SSH 断连。"
+  if ! confirm "是否创建并启用 1 GiB Swap，写入 /etc/fstab 供重启后使用？" n; then
+    red "未创建 Swap，已停止此次安装。请先自行增加 Swap 或内存后重试。"
+    return 1
+  fi
+  if ! create_swap; then
+    red "Swap 创建或持久化未完成，停止安装；已启用的 Swap 会保留。${SWAP_FSTAB_BACKUP:+ fstab 备份：$SWAP_FSTAB_BACKUP}"
+    cleanup_swap
+    return 1
+  fi
+}
+
+install_qrencode_el9() {
+  command -v qrencode >/dev/null && return 0
+  dnf install -y qrencode && return 0
+  if ! rpm -q epel-release >/dev/null 2>&1; then
+    if ! confirm "当前源无可用 qrencode。是否添加 Fedora 官方 EPEL 9 外部软件源后安装二维码工具？" n; then
+      ylw "未添加 EPEL，跳过二维码；客户端链接仍可使用。"
+      return 0
+    fi
+    if ! dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm; then
+      ylw "EPEL 软件源安装失败，跳过二维码；客户端链接仍可使用。"
+      return 0
+    fi
+  fi
+  if ! dnf install -y qrencode; then
+    ylw "qrencode 仍无法安装，请检查 EPEL 是否启用或软件包是否可用；客户端链接仍可使用。"
+  fi
+}
+
 install_deps() {
   step "安装基础依赖"
   local pkgs=() p
@@ -272,13 +396,9 @@ install_deps() {
     if ((${#pkgs[@]})); then
       dnf install -y "${pkgs[@]}" || die "基础依赖安装失败"
     fi
-    if ! command -v qrencode >/dev/null; then
-      if ! dnf install -y qrencode; then
-        ylw "当前软件源没有可用的 qrencode，跳过二维码；客户端链接仍可使用。本脚本不会添加 EPEL。"
-      fi
-    fi
+    install_qrencode_el9 || return 1
   else
-    for p in curl ca-certificates qrencode openssl python3; do
+    for p in curl ca-certificates qrencode openssl python3 iproute2; do
       dpkg -s "$p" &>/dev/null || pkgs+=("$p")
     done
     if ((${#pkgs[@]})); then
@@ -286,7 +406,22 @@ install_deps() {
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null || die "基础依赖安装失败"
     fi
   fi
-  grn "✓ 依赖已就绪"
+  step "核验已安装的依赖"
+  local missing=no
+  for p in curl openssl python3 ss ip; do
+    if command -v "$p" >/dev/null; then grn "✓ $p";
+    else red "✗ $p 不可用"; missing=yes; fi
+  done
+  if { [[ $OS_FAMILY == el9 ]] && rpm -q ca-certificates >/dev/null 2>&1; } || \
+      { [[ $OS_FAMILY == debian ]] && dpkg -s ca-certificates 2>/dev/null | grep -q '^Status: install ok installed'; }; then
+    grn "✓ ca-certificates"
+  else
+    red "✗ ca-certificates 未安装"; missing=yes
+  fi
+  if command -v qrencode >/dev/null; then grn "✓ qrencode（二维码）";
+  else ylw "⚠ qrencode 不可用，跳过二维码；客户端链接仍可使用。"; fi
+  [[ $missing == no ]] || die "核心依赖核验失败，停止安装；请修复上面标记的项目后重试"
+  grn "✓ 核心依赖已就绪"
 }
 
 install_docker() {
@@ -304,6 +439,7 @@ install_docker() {
   fi
   check_docker_engine
   systemctl enable --now docker >/dev/null 2>&1 || die "Docker 服务启动失败"
+  docker info >/dev/null 2>&1 || die "Docker 服务未就绪，请检查 systemctl status docker"
   if ! docker compose version >/dev/null 2>&1; then
     # 固定版本兼容 Docker 20.10，不更换已有 Docker；手动插件不会自动更新。
     local arch dir asset version=2.24.7
@@ -506,7 +642,7 @@ write_compose() {
   mkdir -p "$STACK_DIR" || return 1
   {
     cat <<'EOF'
-# 由 v2ray.sh 生成。域名、UUID、路径、前端模式、镜像版本读取同目录的 .env
+# 由 v2fly-auto-setup.sh 生成。域名、UUID、路径、前端模式、镜像版本读取同目录的 .env
 name: v2ray
 
 services:
@@ -894,6 +1030,7 @@ cmd_install() {
   ylw "开始前请确认：Lightsail 防火墙已放行 TCP 80 和 443；域名 A 记录已指向本机静态 IP"
   load_env
   prompt_config
+  prepare_low_memory || return 1
   install_deps
   install_docker
   open_firewall

@@ -2,7 +2,7 @@
 # 本地标准 Bash mock；不访问网络、不启动 Docker、不修改系统配置。
 set -euo pipefail
 cd "$(dirname "$0")/.."
-SCRIPT="$PWD/v2ray.sh"
+SCRIPT="$PWD/v2fly-auto-setup.sh"
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 export SCRIPT ROOT
@@ -17,7 +17,7 @@ ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
 LOG="$STACK_DIR/log"
 step(){ :; }; grn(){ :; }; ylw(){ :; }; red(){ :; }
 apt-get(){ printf 'FORBIDDEN apt-get %s\n' "$*" >> "$LOG"; return 1; }
-preflight(){ :; }; need_docker(){ :; }; install_deps(){ :; }; install_docker(){ :; }; open_ufw(){ :; }; open_firewall(){ :; }
+prepare_low_memory(){ :; }; preflight(){ :; }; need_docker(){ :; }; install_deps(){ :; }; install_docker(){ :; }; open_ufw(){ :; }; open_firewall(){ :; }
 cmd_status(){ :; }; cmd_show(){ :; }; nginx_hint(){ :; }; show_dns(){ :; }
 sleep(){ :; }; port_in_use(){ return 1; }; confirm(){ return 0; }
 docker(){
