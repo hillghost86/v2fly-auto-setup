@@ -9,6 +9,7 @@ export SCRIPT ROOT
 bash <<'TEST'
 set -euo pipefail
 source "$SCRIPT"
+node_certificate_preflight(){ :; }
 ORIGINAL_INGRESS=$(declare -f node_ingress_apply)
 collect_environment_plan(){ PLAN_CORE=no; PLAN_SWAP=no; PLAN_QR=installed; }
 plan_low_memory(){ :; }; plan_qrencode(){ PLAN_QR=installed; }; execute_environment_plan(){ :; }

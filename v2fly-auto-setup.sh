@@ -196,7 +196,7 @@ plan_qrencode() {
   if command -v qrencode >/dev/null; then PLAN_QR=installed; return 0; fi
   printf '%s\n' '二维码工具尚未安装：' '1) 安装；必要时允许添加 EPEL 9（仅 EL9）' '2) 仅使用现有软件源，失败跳过二维码' '3) 不安装，使用客户端链接' '0) 返回' >&2
   local choice
-  choice=$(node_choice '二维码策略' 2 0123)
+  choice=$(node_choice '二维码策略' 1 0123)
   case $choice in 1) PLAN_QR=allow ;; 2) PLAN_QR=native ;; 3) PLAN_QR=skip ;; *) return 1 ;; esac
 }
 
@@ -484,6 +484,82 @@ ws_ok() {
     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
     "https://$DOMAIN$WS_PATH" 2>/dev/null) || true
   [[ ${code//[[:space:]]/} == 101 ]]
+}
+
+# 预检与失败诊断均只读取本机入口及受管资源。
+caddy_rate_limit_hint() {
+  local domain=$1 trusted=${2:-no} owner
+  [[ $trusted != yes ]] || return 0
+  command -v docker >/dev/null && command -v timeout >/dev/null && command -v python3 >/dev/null || return 0
+  owner=$(timeout 5 docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' v2ray-ingress 2>/dev/null) || return 0
+  [[ $owner == v2ray-ingress ]] || return 0
+  timeout 5 docker logs --since 24h --tail 200 v2ray-ingress 2>&1 | node_python certificate-limit "$domain" 3<&0 || true
+}
+
+node_certificate_preflight() {
+  local domain=$1 front=$2 code status=0 owner mount volume
+  workflow_step '入口证书与存储预检（只读）'
+  if [[ $front == nginx ]]; then
+    echo '证书由现有 Nginx / 宝塔管理；不检查 Caddy 数据卷。'
+  elif command -v docker >/dev/null && command -v timeout >/dev/null; then
+    if owner=$(timeout 5 docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' v2ray-ingress 2>/dev/null); then
+      if [[ $owner == v2ray-ingress ]]; then
+        mount=$(timeout 5 docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}} {{.Name}} {{.Source}}{{end}}{{end}}' v2ray-ingress 2>/dev/null) || mount=''
+        if [[ -n $mount ]]; then printf '共享 Caddy 当前 /data 挂载：%s\n' "$mount";
+        else ylw '未读取到共享 Caddy 的 /data 挂载，证书存储状态未知。'; fi
+      else ylw '同名 Caddy 容器不是本项目资源，不读取其证书存储或日志。'; fi
+    else
+      volume=v2ray-ingress_node_caddy_data
+      if timeout 5 docker volume inspect "$volume" >/dev/null 2>&1; then
+        echo "共享 Caddy 当前没有可读取的容器；预期证书卷 $volume 已存在。"
+      else echo "共享 Caddy 当前没有可读取的容器；预期证书卷 $volume 未确认存在，启动时可能需要申请证书。"; fi
+    fi
+    echo '数据卷存在不代表选中域名的证书可用；不导入旧部署的数据卷。'
+  else echo '缺少 Docker 或 timeout，跳过证书数据卷检查。'; fi
+  if ! command -v curl >/dev/null; then
+    echo '缺少 curl，本机 HTTPS 证书状态未知；环境准备后再检查。'
+    return 0
+  fi
+  code=$(curl -q --noproxy '*' -s -I -o /dev/null -w '%{http_code}' --max-time 8 \
+    --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null) || status=$?
+  if [[ $status == 0 ]]; then
+    grn "✓ 本机 HTTPS 证书通过主机名与信任链验证（HTTP ${code:-000}）；此证书可用于该域名。"
+    if command -v openssl >/dev/null && command -v timeout >/dev/null; then certificate_details "$domain"; fi
+  else
+    case $status in
+      60) ylw '本机 HTTPS 证书验证失败：证书可能过期、域名不匹配或信任链不完整。' ;;
+      35) ylw '本机 TLS 握手失败：当前无法确认域名证书可用。' ;;
+      7|28) ylw '本机 HTTPS 未连接或超时：服务可能未启动，无法判断磁盘是否已有证书。' ;;
+      *) ylw "本机 HTTPS 检查未完成（curl 状态 $status），证书状态未知。" ;;
+    esac
+    [[ $front != caddy ]] || caddy_rate_limit_hint "$domain"
+    [[ $front != caddy ]] || echo '若需要重新签发，请检查域名解析和 80/443 可达性；限流时需等到允许重试。'
+  fi
+  return 0
+}
+
+# 仅输出状态码，不输出响应正文、凭据或任意服务日志。
+ws_diagnose() {
+  local code status=0 detail
+  code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 5 \
+    --resolve "$DOMAIN:443:127.0.0.1" \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "https://$DOMAIN$WS_PATH" 2>/dev/null) || status=$?
+  if [[ $code == 101 ]]; then
+    ylw '等待期间 HTTPS / WebSocket 未就绪；追加诊断已返回 101，可能刚刚恢复。'
+    return 0
+  fi
+  case $status in
+    0) detail="HTTPS 已连通，WebSocket 返回 HTTP ${code:-000}（预期 101）" ;;
+    7) detail='无法连接本机 443，请检查共享 Caddy 是否启动' ;;
+    28) detail='本机 HTTPS 请求超时' ;;
+    35|60) detail='TLS 握手或证书验证失败，请检查证书签发与域名解析' ;;
+    *) detail="HTTPS 请求失败，curl 状态 $status，HTTP ${code:-000}" ;;
+  esac
+  red "HTTPS / WebSocket 自检失败：$detail"
+  caddy_rate_limit_hint "$DOMAIN" "$(if [[ $status == 0 ]]; then echo yes; else echo no; fi)"
+  ylw '可在服务器查看入口日志：docker logs --tail 80 v2ray-ingress（恢复后日志可能已变化）。'
 }
 
 e2e_ok() {
@@ -916,7 +992,55 @@ def set_image(node_id, image):
     render_node(node)
 
 
+def certificate_limit(selected_domain):
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    latest = None
+    selected_domain = selected_domain.lower()
+    for line in os.fdopen(3):
+        try:
+            item = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        names = item.get('identifiers', [])
+        if not isinstance(names, list):
+            names = []
+        names = names + [item.get('identifier'), item.get('domain')]
+        if selected_domain not in [name.lower() for name in names if isinstance(name, str)]:
+            continue
+        message = str(item.get('msg', '')).lower()
+        if 'certificate obtained successfully' in message or 'certificate renewed successfully' in message:
+            latest = None
+            continue
+        error = str(item.get('error', ''))
+        if 'ratelimited' not in error.lower() and 'rate limit' not in error.lower() and 'ratelimited' not in message:
+            continue
+        retry = re.search(r'retry after\s+(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:Z|[+-]\d\d:\d\d)?)', error, re.I)
+        if retry:
+            stamp = retry.group(1).replace(' ', 'T')
+            try:
+                moment = datetime.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                if moment.tzinfo is None:
+                    moment = moment.replace(tzinfo=datetime.timezone.utc)
+                latest = ('past' if moment <= now else 'active', moment.isoformat())
+            except ValueError:
+                latest = ('unknown', '')
+        else:
+            latest = ('unknown', '')
+    if latest:
+        state, stamp = latest
+        if state == 'active':
+            print('选中域名最近有证书签发限流；日志允许重试时间：' + stamp + '（尚未到达）。')
+        elif state == 'past':
+            print('选中域名有历史限流记录；允许重试时间已过去：' + stamp + '；不能据此判断仍在限流。')
+        else:
+            print('选中域名最近有证书签发限流记录；日志未提供可确认的允许重试时间，当前状态需核实。')
+
+
 HANDLERS = {
+    'certificate-limit': certificate_limit,
     'allocate': allocate_node,
     'validate-label': lambda value: print(label_name(value)),
     'validate-domain': lambda value: print(domain(value.strip())),
@@ -1089,6 +1213,7 @@ node_ingress_select() {
     if [[ $front == caddy && $busy == yes ]] && ! container_running v2ray-ingress; then
       ylw '80/443 已被占用，请选择已有 Nginx 或复用已登记入口。'; continue
     fi
+    workflow_step '入口域名'
     while true; do
       d=$(node_input domain '入口域名' "$current_domain") || return 1
       return
@@ -1168,7 +1293,7 @@ node_ready() {
   if [[ $(node_get front) == caddy ]]; then
     local DOMAIN WS_PATH
     DOMAIN=$(node_get domain); WS_PATH=$(node_get path)
-    wait_for ws_ok 36 || return 1
+    if ! wait_for ws_ok 36; then ws_diagnose; return 1; fi
     node_test || return 1
   else
     ylw 'V2Fly 本地入口已就绪；Nginx 反代配置完成后请在管理菜单测试连接。'
@@ -1261,6 +1386,35 @@ node_input() {
   done
 }
 
+# 预览默认值只读取系统状态；确认后沿用同一组值。
+node_preview_defaults() {
+  local p=${1:-auto} ws=${2:-auto} u=${3:-auto} random
+  if command -v python3 >/dev/null; then node_python defaults "$p" "$ws" "$u"; return; fi
+  if [[ $p == auto ]]; then
+    for ((p=2333; p<=65535; p++)); do
+      if ! port_in_use "$p"; then break; fi
+    done
+    ((p<=65535)) || { red '没有可用本地端口' >&2; return 1; }
+  fi
+  if [[ $ws == auto || $u == auto ]]; then
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+      IFS= read -r random < /proc/sys/kernel/random/uuid || return 1
+    else
+      random=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || return 1
+      [[ ${#random} == 32 ]] || return 1
+      random="${random:0:8}-${random:8:4}-4${random:13:3}-8${random:17:3}-${random:20:12}"
+    fi
+    [[ $random =~ ^[a-fA-F0-9-]{36}$ ]] || return 1
+    [[ $u != auto ]] || u=$random
+    if [[ $ws == auto ]]; then
+      random=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n') || return 1
+      [[ ${#random} == 12 ]] || return 1
+      ws=/$random
+    fi
+  fi
+  printf '%s\n' "$p" "$ws" "$u"
+}
+
 cmd_node_add() {
   local edit=${1:-no} d front out p ws u image mode link rd rp ru rw oldimage='' backup existed=no label advanced=no previousimage='' rh rs remote_info='' defaults field
   local PLAN_CORE PLAN_SWAP PLAN_QR
@@ -1281,13 +1435,16 @@ cmd_node_add() {
   label=$(node_input label '节点名称，例如 韩国直出 / 韩国转日本' "$(if [[ $edit == yes ]]; then node_get label 2>/dev/null || node_get id; fi)") || return 0
   workflow_step '4 / 10 HTTPS 入口'
   node_ingress_select || return 0
+  node_certificate_preflight "$d" "$front"
+  defaults=$(node_preview_defaults "$(if [[ $edit == yes ]]; then node_get port; else echo auto; fi)" "$(if [[ $edit == yes ]]; then node_get path; else echo auto; fi)" "$(if [[ $edit == yes ]]; then node_get uuid; else echo auto; fi)") || return 1
+  while IFS= read -r field; do values+=("$field"); done <<< "$defaults"
   workflow_step '5 / 10 高级设置'
   while true; do
     mode=$(node_ask '是否修改高级设置（y/N，0 返回）' n) || return 0
     case $mode in y|Y) advanced=yes; break ;; n|N) break ;; 0) return 0 ;; *) ylw '请输入 y、n 或 0。' >&2 ;; esac
   done
   local port_default
-  port_default=$(if [[ $edit == yes ]]; then node_get port; else echo auto; fi)
+  port_default=$(if [[ $edit == yes ]]; then node_get port; else echo "${values[0]}"; fi)
   while true; do
     p=$(node_option '本地端口' "$port_default" port) || return 0
     if [[ $p != auto ]] && command -v ss >/dev/null && { [[ $edit == no ]] || [[ $p != $(node_get port) ]]; } && port_in_use "$p"; then
@@ -1298,7 +1455,7 @@ cmd_node_add() {
     advanced=yes; port_default=$p
   done
   local path_default
-  path_default=$(if [[ $edit == yes ]]; then node_get path; else echo auto; fi)
+  path_default=$(if [[ $edit == yes ]]; then node_get path; else echo "${values[1]}"; fi)
   while true; do
     ws=$(node_option 'WebSocket 路径' "$path_default" path) || return 0
     if [[ $ws != auto ]] && command -v python3 >/dev/null && ! node_python validate-path "${NODE_ID:-new}" "$d" "$ws"; then
@@ -1306,7 +1463,7 @@ cmd_node_add() {
       advanced=yes; path_default=$ws
     else break; fi
   done
-  u=$(node_option 'UUID' "$(if [[ $edit == yes ]]; then node_get uuid; else echo auto; fi)" uuid) || return 0
+  u=$(node_option 'UUID' "$(if [[ $edit == yes ]]; then node_get uuid; else echo "${values[2]}"; fi)" uuid) || return 0
   image=$(node_option 'V2Fly 镜像标签' "$(if [[ $edit == yes ]]; then node_get image | sed 's|v2fly/v2fly-core:||'; else echo latest; fi)" image) || return 0
   [[ $image == sha256:* ]] || image="v2fly/v2fly-core:$image"
   workflow_step '6 / 10 远端出口'
@@ -1334,6 +1491,10 @@ cmd_node_add() {
   if command -v python3 >/dev/null; then
     remote_info=$(node_python validate-create "${NODE_ID:-new}" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" ${remote_args[@]+"${remote_args[@]}"}) || return 1
   fi
+  defaults=$(node_preview_defaults "$p" "$ws" "$u") || return 1
+  values=()
+  while IFS= read -r field; do values+=("$field"); done <<< "$defaults"
+  p=${values[0]}; ws=${values[1]}; u=${values[2]}
   workflow_step '7 / 10 环境准备计划'
   plan_low_memory || return 0
   plan_qrencode || return 0
@@ -1343,14 +1504,16 @@ cmd_node_add() {
   environment_summary
   if [[ $front == nginx ]]; then ylw 'Nginx 状态：创建后待手工配置 HTTPS 转发。';
   else echo '防火墙：为 Caddy 放行 80/443（仅修改已启用的防火墙）。'; fi
+  printf '\n'
   confirm '确认执行以上全部计划？' n || return 0
   workflow_step '9 / 10 执行准备与创建'
   execute_environment_plan || return 1
-  defaults=$(node_python defaults "$p" "$ws" "$u") || return 1
-  while IFS= read -r field; do values+=("$field"); done <<< "$defaults"
-  p=${values[0]}; ws=${values[1]}; u=${values[2]}
   remote_info=$(node_python validate-create "${NODE_ID:-new}" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" ${remote_args[@]+"${remote_args[@]}"}) || return 1
   [[ -z $remote_info ]] || echo "$remote_info"
+  if { [[ $edit == no ]] || [[ $p != $(node_get port) ]]; } && port_in_use "$p"; then
+    red '本地端口在确认后已被占用，停止创建；请重新选择端口。'
+    return 1
+  fi
   if [[ $edit == no ]]; then NODE_ID=$(node_python allocate) || return 1; fi
   node_owner "v2ray-node-$NODE_ID" "v2ray-node-$NODE_ID" || return 1
   open_firewall "$front" || return 1
