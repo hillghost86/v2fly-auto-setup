@@ -13,8 +13,9 @@
 #          127.0.0.1:2333，证书和 443 交给 Nginx，由用户在 Nginx 里反代过来
 #
 # 文件位置:
-#   /root/v2ray-stack/.env          域名、UUID、路径、前端模式、镜像版本（脚本与 compose 共用）
-#   /root/v2ray-stack/compose.yaml  容器定义（V2Ray 与 Caddy 配置内嵌其中）
+#   /root/v2fly-stack/.env          域名、UUID、路径、前端模式、镜像版本（脚本与 compose 共用）
+#   /root/v2fly-stack/compose.yaml  容器定义（V2Ray 与 Caddy 配置内嵌其中）
+#   已有 /root/v2ray-stack 时沿用旧目录，不自动搬移；两目录并存时停止操作。
 #   Docker 数据卷 caddy_data         HTTPS 证书（仅 caddy 模式）
 # =============================================================================
 # 换行符自愈：Windows 格式（CRLF）会让脚本无法运行，这里自动去掉 \r 后重新执行。
@@ -25,7 +26,7 @@ _s=${BASH_SOURCE[0]:-$0}; if [[ -f $_s ]] && IFS= read -r _l < "$_s" 2>/dev/null
 
 set -euo pipefail
 
-STACK_DIR=/root/v2ray-stack
+STACK_DIR=/root/v2fly-stack
 ENV_FILE="$STACK_DIR/.env"
 COMPOSE_FILE="$STACK_DIR/compose.yaml"
 MIN_COMPOSE=2.23.1
@@ -210,12 +211,12 @@ container_running() { [[ -n "$(docker ps -q --filter "name=^$1\$" 2>/dev/null)" 
 # ---------------------------------------------------------------------------
 # 环境准备
 # ---------------------------------------------------------------------------
-# 所有子命令都要 root：配置在 /root/v2ray-stack 下（.env 是 600，里面的 UUID
+# 所有子命令都要 root：配置在选定的 STACK_DIR 下（.env 是 600，里面的 UUID
 # 等同密码），Docker、apt、systemd、80/443 端口也都要。放在 main() 里统一拦，
 # 比在各个子命令里分别调更难漏——尤其是无参数进菜单时，menu() 第一行就是
 # load_env，非 root 下有可能连报错都来不及打就被 set -e 终止
 need_root() {
-  [[ $EUID -eq 0 ]] || die "需要 root 运行。配置在 /root/v2ray-stack 下，普通用户读不到。
+  [[ $EUID -eq 0 ]] || die "需要 root 运行。配置在 ${STACK_DIR} 下，普通用户读不到。
   请用: sudo -i 切到 root，或 curl -fsSL <脚本地址> | sudo bash -s -- ${1:-install}"
 }
 
@@ -1793,7 +1794,24 @@ menu() {
   esac
 }
 
+select_stack_dir() {
+  local base=${1:-/root} new_dir old_dir
+  new_dir="$base/v2fly-stack"; old_dir="$base/v2ray-stack"
+  if [[ -e $new_dir && -e $old_dir ]]; then
+    red "新旧部署目录同时存在：${new_dir} 与 ${old_dir}。请先确认实际使用目录；脚本停止操作，不自动覆盖或搬移。" >&2
+    return 1
+  fi
+  if [[ -e $old_dir ]]; then
+    STACK_DIR=$old_dir
+    ylw "检测到旧部署目录，继续使用 ${STACK_DIR}；为保留现有容器与 Caddy 挂载，不自动搬移。" >&2
+  else STACK_DIR=$new_dir; fi
+  ENV_FILE="$STACK_DIR/.env"
+  COMPOSE_FILE="$STACK_DIR/compose.yaml"
+}
+
+
 main() {
+  select_stack_dir || return 1
   # 每个有效子命令都先过 need_root。未知命令不用拦——那只是提示用法，
   # 非 root 也该看到「未知命令」而不是「需要 root」
   case "${1:-}" in

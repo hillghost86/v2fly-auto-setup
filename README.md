@@ -53,7 +53,7 @@ CentOS Linux 8、CentOS Stream 8、RHEL 及其他发行版暂不在新增支持�
 
 ## 使用
 
-所有子命令都要 root（配置在 `/root/v2ray-stack` 下，还要动 Docker、包管理器、systemd 和 80/443 端口）。先 `sudo -i` 切到 root，然后：
+所有子命令都要 root（配置在 `/root/v2fly-stack` 下，还要动 Docker、包管理器、systemd 和 80/443 端口）。先 `sudo -i` 切到 root，然后：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v2fly-auto-setup.sh)
@@ -206,15 +206,17 @@ Caddy 模式要独占 80 和 443，机器上装了宝塔面板（或任何 Nginx
 
 ## 文件位置
 
+新安装使用 `/root/v2fly-stack`。如果只存在旧目录 `/root/v2ray-stack`，脚本会提示并继续管理旧目录，不自动移动文件，以保留运行中容器的挂载路径。两个目录同时存在时会停止并提示先核实，避免误操作另一套配置。不要直接重命名正在使用的目录。
+
 ```
-/root/v2ray-stack/.env           域名、UUID、路径、前端模式、镜像版本（权限 600）
-/root/v2ray-stack/compose.yaml   容器定义，V2Ray 和 Caddy 的配置内嵌其中
-/root/v2ray-stack/nodes/.id-sequence        节点编号分配记录（删除节点不回退）
-/root/v2ray-stack/nodes/<id>/metadata.json  新节点参数（权限 600）
-/root/v2ray-stack/nodes/<id>/config.json    新节点 V2Fly 配置（权限 600）
-/root/v2ray-stack/nodes/<id>/compose.yaml   每个节点的独立容器定义
-/root/v2ray-stack/ingress/Caddyfile         共享 Caddy 入口配置
-/root/v2ray-stack/ingress.yaml              共享入口定义或标准旧 Caddy 的覆盖文件
+/root/v2fly-stack/.env           域名、UUID、路径、前端模式、镜像版本（权限 600）
+/root/v2fly-stack/compose.yaml   容器定义，V2Ray 和 Caddy 的配置内嵌其中
+/root/v2fly-stack/nodes/.id-sequence        节点编号分配记录（删除节点不回退）
+/root/v2fly-stack/nodes/<id>/metadata.json  新节点参数（权限 600）
+/root/v2fly-stack/nodes/<id>/config.json    新节点 V2Fly 配置（权限 600）
+/root/v2fly-stack/nodes/<id>/compose.yaml   每个节点的独立容器定义
+/root/v2fly-stack/ingress/Caddyfile         共享 Caddy 入口配置
+/root/v2fly-stack/ingress.yaml              共享入口定义或标准旧 Caddy 的覆盖文件
 docker volume caddy_data         HTTPS 证书（仅 Caddy 模式）
 docker volume caddy_config       Caddy 运行时配置（仅 Caddy 模式）
 ```
@@ -237,7 +239,7 @@ ss -tlnp | grep ':80 '
 
 **服务起来了但连不上** — 跑一次「查看运行状态」，三项自检会分别指出是证书/握手、UUID/路径，还是 Cloudflare 边缘的问题。特别注意「源站全绿但客户端连不上」这种情况，多半是上面说的多级子域。
 
-**提示需要 root** — 所有子命令都要 root，包括只读的 `status` 和 `show`（配置在 `/root/v2ray-stack` 下，`.env` 是 600）。用法见上面「使用」一节。
+**提示需要 root** — 所有子命令都要 root，包括只读的 `status` 和 `show`（配置在 `/root/v2fly-stack` 下，`.env` 是 600）。用法见上面「使用」一节。
 
 **在 Windows 上编辑过脚本** — 脚本开头自带 CRLF 自愈，是磁盘上的普通文件时会去掉 `\r` 再重新执行自己，不用手动 `dos2unix`。通过管道运行时不做这个检查（那种情况下也不会有 CRLF），否则读取自身会把数据从管道里抢走、导致脚本被截断。
 

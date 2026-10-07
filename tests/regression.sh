@@ -156,3 +156,39 @@ BASH
   printf 'PASS %s\n' "$1"
 }
 for test in temp e2e run success pull up ready rollback install install_pull first ownership plugin engine checksum cancel signal; do run_case "$test" || { printf 'FAIL %s\n' "$test" >&2; exit 1; }; done
+
+# 部署目录选择仅检查存在性，不创建、搬移或覆盖目录。
+bash <<'DIRECTORY'
+set -euo pipefail
+source "$SCRIPT"
+base="$ROOT/stack-directory"
+declare -f check_domain >/dev/null
+select_stack_dir "$base"
+[[ $STACK_DIR == "$base/v2fly-stack" && $ENV_FILE == "$STACK_DIR/.env" && $COMPOSE_FILE == "$STACK_DIR/compose.yaml" ]]
+[[ ! -e $base ]]
+echo 'PASS stack-directory-fresh-default-readonly'
+mkdir -p "$base/v2ray-stack"
+printf 'original configuration\n' > "$base/v2ray-stack/.env"
+select_stack_dir "$base" 2> "$ROOT/legacy-directory-warning"
+[[ $STACK_DIR == "$base/v2ray-stack" && $ENV_FILE == "$STACK_DIR/.env" && $COMPOSE_FILE == "$STACK_DIR/compose.yaml" ]]
+[[ $(cat "$ENV_FILE") == 'original configuration' && ! -e $base/v2fly-stack ]]
+[[ $(cat "$ROOT/legacy-directory-warning") == *'继续使用'* && $(cat "$ROOT/legacy-directory-warning") == *'不自动搬移'* ]]
+echo 'PASS stack-directory-legacy-retained-readonly'
+mkdir "$base/v2fly-stack"
+printf 'new configuration\n' > "$base/v2fly-stack/.env"
+if select_stack_dir "$base" 2> "$ROOT/directory-conflict"; then exit 1; fi
+[[ $(cat "$base/v2ray-stack/.env") == 'original configuration' && $(cat "$base/v2fly-stack/.env") == 'new configuration' ]]
+[[ $(cat "$ROOT/directory-conflict") == *'同时存在'* ]]
+echo 'PASS stack-directory-conflict-stops-without-overwrite'
+# main 实际调用目录选择，并在冲突时不分派管理动作。
+eval "$(declare -f select_stack_dir | sed '1s/select_stack_dir/select_test_stack_dir/')"
+select_stack_dir(){ select_test_stack_dir "$base"; }
+need_root(){ :; }
+cmd_status(){ printf 'called\n' > "$ROOT/selected-status"; }
+if main status 2>/dev/null; then exit 1; fi
+[[ ! -e $ROOT/selected-status ]]
+rmdir "$base/v2fly-stack" 2>/dev/null || { rm "$base/v2fly-stack/.env"; rmdir "$base/v2fly-stack"; }
+main status 2>/dev/null
+[[ -f $ROOT/selected-status && $STACK_DIR == "$base/v2ray-stack" ]]
+echo 'PASS stack-directory-main-selection-and-conflict-guard'
+DIRECTORY

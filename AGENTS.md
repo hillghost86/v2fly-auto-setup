@@ -4,7 +4,8 @@
 
 - 本项目是 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 和 CentOS Stream 9 上的 V2Fly + Caddy 安装管理脚本，支持已有 Nginx 的部署方式。
 - `v2fly-auto-setup.sh` 是 Bash 入口；`README.md` 记录服务器使用方法。
-- 运行配置位于服务器的 `/root/v2ray-stack`；新节点存放于 `nodes/<id>/`，每个节点独立 Compose 项目，Caddy 入口共享。不要把真实 UUID、域名配置或证书带入仓库。
+- 运行配置位于服务器的 `/root/v2fly-stack`；新节点存放于 `nodes/<id>/`，每个节点独立 Compose 项目，Caddy 入口共享。不要把真实 UUID、域名配置或证书带入仓库。
+- 新安装使用 `/root/v2fly-stack`；仅存在旧目录 `/root/v2ray-stack` 时沿用旧路径，两个目录同时存在时停止，不自动迁移运行中的挂载。
 - 多节点管理只处理新流程创建的节点，不承担手工中转配置的导入或迁移；新增节点元数据按 JSON 解析，不作为 Shell 执行。
 
 ## 开发与验证
