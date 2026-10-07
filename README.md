@@ -6,13 +6,36 @@
 
 机器上已经有宝塔面板或别的 Nginx 占着 80 / 443 也能装：安装时选「已有 Nginx」模式，脚本只跑 V2Ray，证书和 443 交给 Nginx，见下方「[和宝塔面板共存](#和宝塔面板--已有-nginx-共存)」。
 
+## 多节点与中转
+
+同一台服务器可以运行多个独立 V2Fly 容器，每个节点有自己的 UUID、WebSocket 路径、回环地址端口和出站配置。HTTPS 入口可以共用域名和 443，通过不同路径分发；节点的修改、重启和删除按节点执行。
+
+例如，在韩国服务器创建两个节点：
+
+| 客户端节点 | 连接线路 | 网站看到的出口 |
+| --- | --- | --- |
+| 韩国直出 | Shadowrocket → 韩国 → 网站 | 韩国服务器 |
+| 韩国转日本 | Shadowrocket → 韩国 → 日本 → 网站 | 日本服务器 |
+
+分别导入两条 `vmess://` 链接，在 Shadowrocket 中切换即可。中转出口支持 VMess + WebSocket + TLS，可导入远端链接或手动填写地址、端口、UUID、WebSocket 路径及 TLS / Host 参数。中转失败不会自动切换为本机直出。
+
+新增节点流程要求服务器已经准备好 Docker、满足版本要求的 Compose、Python 3 及脚本检查所需的基础工具；它不会自动安装系统依赖。创建或更新节点会按所选标签拉取容器镜像。
+
+首次复用本脚本标准部署的旧 Caddy 入口时，需要重建一次 Caddy 以挂载持久化入口配置，现有连接会短暂中断；原单节点 `.env` 和 `compose.yaml` 保留。之后的路径变更使用重载。
+
+入口有三种选择：复用已有 HTTPS 入口、新建 Caddy 管理的域名、使用已有 Nginx / 宝塔。复用 Nginx 入口仍需将脚本输出的新路径反向代理片段加入对应 HTTPS 站点并重载；脚本不会修改面板配置，也不会替你操作云厂商安全组。Caddy 与已有 Nginx 不能同时争用同一地址的 80/443。
+
+多节点管理只负责通过新流程创建的节点，不导入、识别或迁移手工修改的中转配置。旧版配置保留在原目录；需要两条可独立管理的线路时，分别新增直出节点和中转节点。
+
+节点容器独立，HTTPS 前端仍为共享资源。新增、删除或修改入口路径需要更新前端配置；Caddy 重载可能使现有 WebSocket 连接重新建立，因此不能承诺入口变更完全无中断。仅修改节点出口或重启指定节点，不应重建其他节点容器。
+
 ## 需要准备
 
 - 一台 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 或 CentOS Stream 9 服务器（需要 systemd，root 权限）
 - 一个域名，A 记录指向服务器公网 IP
 - 服务器防火墙放行 **TCP 80 和 443**（80 用来申请证书，不能省）
 
-Docker、Docker Compose 和基础依赖由脚本安装。EL9 系列的二维码工具 `qrencode` 为可选依赖。当前软件源不提供时，脚本会询问是否添加 Fedora 官方 EPEL 9 软件源；同意后直接安装官方软件源 RPM，再安装工具。默认不添加；拒绝或安装失败时跳过二维码，客户端链接仍可正常输出。
+旧单节点 `install` 流程会安装 Docker、Docker Compose 和基础依赖。EL9 系列的二维码工具 `qrencode` 为可选依赖。当前软件源不提供时，脚本会询问是否添加 Fedora 官方 EPEL 9 软件源；同意后直接安装官方软件源 RPM，再安装工具。默认不添加；拒绝或安装失败时跳过二维码，客户端链接仍可正常输出。
 
 基础依赖安装后会逐项核验 `curl`、`openssl`、`python3`、`ss`、`ip` 是否可用，以及 `ca-certificates` 是否已安装，并显示成功或缺失状态。核心依赖缺失会停止安装；`qrencode` 缺失会提示二维码不可用。Docker 另行检查服务响应和 Compose 版本。
 
@@ -45,12 +68,12 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v
 不带参数会进菜单：
 
 ```
- 1) 安装 / 修改配置
- 2) 更新到最新版
- 3) 查看运行状态
- 4) 显示客户端链接和二维码
- 5) 只显示链接（不显示二维码）
- 6) 卸载
+ 1) 新增节点
+ 2) 管理节点
+ 3) 所有节点状态
+ 4) 更新指定节点
+ 5) 卸载（逐个选择节点删除）
+ 6) 旧单节点菜单
  0) 退出
 ```
 
@@ -58,19 +81,36 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v
 
 | 子命令 | 作用 |
 | --- | --- |
-| `install` | 安装，或修改域名 / UUID / 路径后重新应用 |
-| `update` | 拉最新镜像重建容器，失败时自动恢复旧配置和旧镜像 |
-| `status` | 容器状态、版本、证书有效期、链路自检 |
-| `show` | 打印客户端配置、vmess 链接和二维码（`show plain` 不画二维码） |
-| `uninstall` | 删除容器，可选一并删除证书和配置目录 |
+| `node-add` | 新增独立容器节点，选择 HTTPS 入口和直出 / 中转出口 |
+| `node-manage` | 选择新节点，显示链接、修改、测试、查看日志、重启、删除或更新 |
+| `nodes` | 列出节点配置和容器状态 |
+| `install` | 旧单节点安装，或修改域名 / UUID / 路径后重新应用 |
+| `update` | 更新旧单节点，失败时自动恢复旧配置和旧镜像 |
+| `status` | 查看旧单节点的容器状态、版本、证书和链路 |
+| `show` | 打印旧单节点的配置、链接和二维码（`show plain` 不画二维码） |
+| `uninstall` | 卸载旧单节点，可选删除旧证书和配置目录 |
 
-安装时需要填 5 项，回车即用默认值：
+旧单节点 `install` 流程需要填 5 项，回车即用默认值：
 
 - **域名** — 已解析到本机的那个
 - **UUID** — 回车随机生成
 - **WebSocket 路径** — 回车随机生成，例如 `/a1b2c3`
 - **是否走 Cloudflare CDN** — 决定域名检查时的排查提示
 - **HTTPS 由谁负责** — 默认脚本自带的 Caddy；机器上已有宝塔 / Nginx 占着 443 时选「已有 Nginx」（首次安装检测到 443 被占会自动把默认值切过去）
+
+### 新增韩国直出和韩国转日本
+
+使用本版本脚本，依次运行两次：
+
+```bash
+bash v2fly-auto-setup.sh node-add
+```
+
+第一次创建直出节点，选择已有 Nginx 或 Caddy 入口，出口选「本机直出」。第二次创建中转节点，复用相同的入口域名，使用另一个自动生成的路径和本地端口，出口选「远端 VMess + WS + TLS 中转」，导入日本节点链接或手动填写远端参数。日本端继续使用原来的服务。
+
+已有 Nginx 模式下，把两次输出的 `location` 配置分别加入域名的 HTTPS `server` 块，检查 Nginx 配置并重载后，通过「管理节点 → 测试连接」验证。Nginx 尚未配置时，容器启动不等于客户端已经可以连接。
+
+分别复制输出的节点链接导入 Shadowrocket。切换到对应节点，通过代理查询出口 IP，确认直出节点为韩国出口、中转节点为日本出口。规则模式下被配置为直连的请求不会走这些节点。
 
 ## 装完之后
 
@@ -165,11 +205,16 @@ Caddy 模式要独占 80 和 443，机器上装了宝塔面板（或任何 Nginx
 ```
 /root/v2ray-stack/.env           域名、UUID、路径、前端模式、镜像版本（权限 600）
 /root/v2ray-stack/compose.yaml   容器定义，V2Ray 和 Caddy 的配置内嵌其中
+/root/v2ray-stack/nodes/<id>/metadata.json  新节点参数（权限 600）
+/root/v2ray-stack/nodes/<id>/config.json    新节点 V2Fly 配置（权限 600）
+/root/v2ray-stack/nodes/<id>/compose.yaml   每个节点的独立容器定义
+/root/v2ray-stack/ingress/Caddyfile         共享 Caddy 入口配置
+/root/v2ray-stack/ingress.yaml              共享入口定义或标准旧 Caddy 的覆盖文件
 docker volume caddy_data         HTTPS 证书（仅 Caddy 模式）
 docker volume caddy_config       Caddy 运行时配置（仅 Caddy 模式）
 ```
 
-想改配置不用手动编辑这些文件，重跑脚本选「安装 / 修改配置」即可，原值会作为默认值带出来。
+新节点请通过「管理节点 → 修改」更新配置。旧单节点仍通过旧菜单修改；存在新节点或共享入口覆盖文件时，旧安装、更新和卸载操作会被阻止，避免覆盖共享入口或删除新节点目录。
 
 ## 常见问题
 
@@ -208,6 +253,7 @@ bash -n v2fly-auto-setup.sh
 bash tests/regression.sh
 bash tests/el9.sh
 bash tests/swap.sh
+bash tests/nodes.sh
 ```
 
 回归测试需要 Bash 和 Python 3，使用模拟命令检查安装分支、资源清理和失败恢复，不下载依赖、不操作真实 Docker 或系统配置。它不能代替服务器上的实际部署验证。
