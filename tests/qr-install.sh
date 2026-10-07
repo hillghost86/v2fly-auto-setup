@@ -6,7 +6,7 @@ SCRIPT="$PWD/v2fly-auto-setup.sh"
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 export SCRIPT ROOT
-for test in installed refuse eof debian debian-failure el9-native el9-epel el9-epel-refuse el9-epel-failure el9-package-failure unknown-os memory-refuse repeat plain previous-attempt; do
+for test in installed skip missing-show debian debian-failure el9-native el9-epel el9-native-skip el9-epel-failure el9-package-failure show-no-os show-no-swap repeat plain skip-pure; do
  bash -s -- "$test" <<'BASH'
 set -euo pipefail
 source "$SCRIPT"
@@ -15,10 +15,9 @@ U=11111111-2222-4333-8444-555555555555
 node_python create 1 one.example.com nginx direct 2333 /one "$U" v2fly/v2fly-core:latest
 IN=0; HAVE_QR=no; HAVE_EPEL=no; OS_FAMILY=''
 [[ $TEST != installed ]] || HAVE_QR=yes
-[[ $TEST != previous-attempt ]] || QR_INSTALL_ATTEMPTED=yes
 command(){ if [[ $* == '-v qrencode' ]]; then [[ $HAVE_QR == yes ]]; else builtin command "$@"; fi; }
-detect_os(){ printf 'detect-os\n' >> "$LOG"; if [[ $TEST == unknown-os ]]; then return 1; elif [[ $TEST == el9-* ]]; then OS_FAMILY=el9; else OS_FAMILY=debian; fi; }
-prepare_low_memory(){ printf 'memory-check\n' >> "$LOG"; [[ $TEST != memory-refuse ]]; }
+detect_os(){ printf 'detect-os\n' >> "$LOG"; if [[ $TEST == show-no-os ]]; then return 1; elif [[ $TEST == el9-* ]]; then OS_FAMILY=el9; else OS_FAMILY=debian; fi; }
+needs_swap(){ printf 'memory-check\n' >> "$LOG"; [[ $TEST != show-no-swap ]]; }
 tput(){ echo 120; }
 qrencode(){ cat >/dev/null; printf 'qr %s\n' "$*" >> "$LOG"; if [[ $* == *ASCII* ]]; then printf '%060d\n' 0; else echo rendered-qr; fi; }
 apt-get(){
@@ -37,45 +36,32 @@ dnf(){
   HAVE_QR=yes
  else return 1; fi
 }
-# 记录提示，保留真实默认N与EOF行为。
-eval "$(declare -f confirm | sed '1s/confirm/confirm_original/')"
-confirm(){ printf 'confirm %s\n' "$1" >> "$LOG"; confirm_original "$@"; }
+confirm(){ printf 'FORBIDDEN confirm\n' >> "$LOG"; return 99; }
+# 显式执行已确认的策略；展示函数始终只读。
+policy=native
 case "$TEST" in
- plain) node_show plain </dev/null > "$ROOT/$TEST.output" ;;
- refuse) node_show <<< 'n' > "$ROOT/$TEST.output" ;;
- eof) node_show </dev/null > "$ROOT/$TEST.output" ;;
- el9-epel-refuse) node_show > "$ROOT/$TEST.output" <<'INPUT'
-y
-n
-INPUT
- ;;
- *) node_show > "$ROOT/$TEST.output" <<'INPUT'
-y
-y
-INPUT
- ;;
+ skip|missing-show|plain|skip-pure|show-no-os|show-no-swap) policy=skip ;;
+ el9-epel|el9-epel-failure|el9-package-failure) policy=allow ;;
 esac
-[[ $(cat "$ROOT/$TEST.output") == *vmess://* ]]
+if [[ $TEST == el9-* ]]; then OS_FAMILY=el9; else OS_FAMILY=debian; fi
+if [[ $TEST != installed && $TEST != plain ]]; then install_optional_qr "$policy" || exit 1; fi
+node_show > "$ROOT/$TEST.output" </dev/null || exit 1
+[[ $(cat "$ROOT/$TEST.output") == *vmess://* && $(cat "$LOG") != *FORBIDDEN* && $(cat "$LOG") != *memory-check* ]] || exit 1
 case "$TEST" in
- installed) [[ $(cat "$LOG") == *'qr -l M -t ANSIUTF8'* && $(cat "$LOG") != *confirm* && $(cat "$LOG") != *memory-check* ]] ;;
- plain|previous-attempt) [[ ! -s $LOG ]] ;;
- refuse|eof) [[ $(cat "$LOG") == *'confirm 是否安装二维码工具'* && $(cat "$LOG") != *memory-check* && $(cat "$LOG") != *apt* && $(cat "$LOG") != *dnf* ]] ;;
- debian) [[ $(cat "$LOG") == *'apt install -y -qq qrencode'* && $(cat "$LOG") == *'qr -l M -t ANSIUTF8'* && $(cat "$LOG") != *docker* ]] ;;
- el9-native) [[ $(cat "$LOG") == *'dnf install -y qrencode'* && $(cat "$LOG") != *EPEL* && $(cat "$LOG") == *'qr -l M -t ANSIUTF8'* ]] ;;
- el9-epel) [[ $(cat "$LOG") == *'confirm 当前源无可用 qrencode'* && $(cat "$LOG") == *'dnf install -y https://dl.fedoraproject.org/'* && $(cat "$LOG") == *'qr -l M -t ANSIUTF8'* ]] ;;
- el9-epel-refuse) [[ $(cat "$LOG") != *'dnf install -y https://'* && $(cat "$LOG") != *'qr -l '* ]] ;;
- unknown-os)
-  [[ $(cat "$LOG") != *memory-check* && $(cat "$LOG") != *apt* && $(cat "$LOG") != *dnf* && $(cat "$LOG") != *'qr -l '* && -z $OS_FAMILY ]]
-  ;;
- memory-refuse) [[ $(cat "$LOG") != *apt* && $(cat "$LOG") != *dnf* && $(cat "$LOG") != *'qr -l '* ]] ;;
- debian-failure|el9-epel-failure|el9-package-failure) [[ $(cat "$LOG") != *'qr -l '* ]] ;;
+ installed) [[ $(cat "$LOG") == *'qr -l M -t ANSIUTF8'* && $(cat "$LOG") != *apt* ]] || exit 1 ;;
+ plain)
+  : > "$LOG"; node_show plain </dev/null >/dev/null || exit 1; [[ ! -s $LOG ]] || exit 1 ;;
+ skip|missing-show|skip-pure|show-no-os|show-no-swap) [[ ! -s $LOG ]] || exit 1 ;;
+ debian) [[ $(cat "$LOG") == *'apt install -y -qq qrencode'* && $(cat "$LOG") == *'qr -l M -t ANSIUTF8'* ]] || exit 1 ;;
+ el9-native) [[ $(cat "$LOG") == *'dnf install -y qrencode'* && $(cat "$LOG") != *epel-release* && $(cat "$LOG") == *'qr -l M -t ANSIUTF8'* ]] || exit 1 ;;
+ el9-epel) [[ $(cat "$LOG") == *'dnf install -y https://dl.fedoraproject.org/'* && $(cat "$LOG") == *'qr -l M -t ANSIUTF8'* ]] || exit 1 ;;
+ el9-native-skip) [[ $(cat "$LOG") != *'dnf install -y https://'* && $(cat "$LOG") != *'qr -l '* ]] || exit 1 ;;
+ debian-failure|el9-epel-failure|el9-package-failure) [[ $(cat "$LOG") != *'qr -l '* ]] || exit 1 ;;
  repeat)
-  HAVE_QR=no
-  : > "$LOG"
-  node_show </dev/null >/dev/null
-  [[ ! -s $LOG ]]
-  ;;
+  HAVE_QR=no; : > "$LOG"; node_show </dev/null >/dev/null || exit 1
+  [[ ! -s $LOG ]] || exit 1 ;;
 esac
+
 BASH
  printf 'PASS %s\n' "$test"
 done

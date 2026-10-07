@@ -6,15 +6,18 @@ SCRIPT="$PWD/v2fly-auto-setup.sh"
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 export SCRIPT ROOT
-for test in ready missing-deps missing-ca refuse eof install-failure recheck-failure no-docker no-compose stopped-daemon old-compose invalid-compose podman optional-qr unsupported-os edit-no-install memory-high memory-existing-swap memory-refuse memory-create memory-failure; do
+for test in ready missing-deps missing-ca missing-python missing-curl missing-openssl missing-ss missing-ip no-docker no-compose stopped-daemon old-compose invalid-compose podman optional-qr unsupported-os compose-v-prefix memory-high memory-existing-swap memory-refuse memory-create memory-failure; do
  status=0
  bash -s -- "$test" <<'BASH' || status=$?
 set -euo pipefail
 source "$SCRIPT"
 TEST=$1; STACK_DIR="$ROOT/$TEST/stack"; LOG="$ROOT/$TEST.log"; : > "$LOG"
+MISSING_COMMAND=''
 IN=0; HAVE_DEPS=yes; HAVE_CA=yes; HAVE_DOCKER=yes; HAVE_COMPOSE=yes; DAEMON=yes; COMPOSE_VERSION=2.24.7
 case "$TEST" in
- missing-deps|refuse|eof|install-failure|recheck-failure|edit-no-install) HAVE_DEPS=no ;;
+ missing-deps) HAVE_DEPS=no ;;
+ missing-python|missing-curl|missing-openssl|missing-ss|missing-ip) MISSING_COMMAND=${TEST#missing-} ;;
+ compose-v-prefix) COMPOSE_VERSION=v2.24.7 ;;
  missing-ca) HAVE_CA=no ;;
  no-docker) HAVE_DOCKER=no; HAVE_COMPOSE=no ;;
  no-compose) HAVE_COMPOSE=no ;;
@@ -29,6 +32,7 @@ eval "$(declare -f detect_os | sed '1s/detect_os/detect_os_fixture/')"
 detect_os(){ detect_os_fixture "$OS_FILE"; }
 command(){
  if [[ ${1:-} == -v ]]; then
+  [[ $2 != "$MISSING_COMMAND" ]] || return 1
   case "$2" in
    python3|curl) [[ $HAVE_DEPS == yes ]] ;;
    docker) [[ $HAVE_DOCKER == yes ]] ;;
@@ -49,73 +53,44 @@ docker(){
   *) printf 'FORBIDDEN docker mutation\n' >> "$LOG"; exit 99 ;;
  esac
 }
-# Shared initializer remains real; host mutations in each stage are mocked.
-eval "$(declare -f prepare_low_memory | sed '1s/prepare_low_memory/prepare_low_memory_fixture/')"
-MEM_FILE="$ROOT/$TEST.mem"; SWAPS_FILE="$ROOT/$TEST.swaps"
-printf 'MemTotal: 524288 kB\n' > "$MEM_FILE"
-printf 'Filename Type Size Used Priority\n' > "$SWAPS_FILE"
-[[ $TEST != memory-high ]] || printf 'MemTotal: 2097152 kB\n' > "$MEM_FILE"
-[[ $TEST != memory-existing-swap ]] || printf '/existing file 1048576 0 -2\n' >> "$SWAPS_FILE"
-prepare_low_memory(){
- printf 'prepare-memory\n' >> "$LOG"
- if [[ $TEST == memory-* ]]; then prepare_low_memory_fixture "$MEM_FILE" "$SWAPS_FILE"; fi
-}
-create_swap(){ printf 'create-swap\n' >> "$LOG"; [[ $TEST != memory-failure ]]; }
-install_deps(){
- printf 'install-deps\n' >> "$LOG"
- [[ $TEST != install-failure ]] || return 1
- if [[ $TEST != recheck-failure ]]; then HAVE_DEPS=yes; HAVE_CA=yes; fi
-}
-install_docker(){ printf 'install-docker\n' >> "$LOG"; HAVE_DOCKER=yes; HAVE_COMPOSE=yes; DAEMON=yes; }
-node_choice(){ printf 'node-type\n' >> "$LOG"; printf 0; }
-open_firewall(){ printf 'FORBIDDEN firewall\n' >> "$LOG"; exit 99; }
-# 记录真实 confirm 调用；不替代读取和默认值。
-eval "$(declare -f confirm | sed '1s/confirm/confirm_fixture/')"
-confirm(){ printf 'confirmation\n' >> "$LOG"; confirm_fixture "$@"; }
-if [[ $TEST == edit-no-install ]]; then
- NODE_ID=1
- if cmd_node_add yes </dev/null > "$ROOT/$TEST.output"; then exit 1; fi
-elif [[ $TEST == refuse || $TEST == memory-refuse ]]; then
- if cmd_node_add <<< 'n' > "$ROOT/$TEST.output"; then exit 1; fi
-elif [[ $TEST == eof ]]; then
- if cmd_node_add </dev/null > "$ROOT/$TEST.output"; then exit 1; fi
-elif [[ $TEST == install-failure || $TEST == recheck-failure || $TEST == old-compose || $TEST == invalid-compose || $TEST == memory-failure ]]; then
- if cmd_node_add <<< 'y' > "$ROOT/$TEST.output"; then exit 1; fi
+assert(){ "$@" || exit 1; }
+# 检测入口不再读取用户输入或安装；执行计划由上层最终确认后调用。
+if [[ $TEST == memory-* ]]; then
+ MEM_FILE="$ROOT/$TEST.mem"; SWAPS_FILE="$ROOT/$TEST.swaps"
+ printf 'MemTotal: 524288 kB\n' > "$MEM_FILE"
+ printf 'Filename Type Size Used Priority\n' > "$SWAPS_FILE"
+ [[ $TEST != memory-high ]] || printf 'MemTotal: 2097152 kB\n' > "$MEM_FILE"
+ [[ $TEST != memory-existing-swap ]] || printf '/existing file 1048576 0 -2\n' >> "$SWAPS_FILE"
+ eval "$(declare -f needs_swap | sed '1s/needs_swap/needs_swap_fixture/')"
+ needs_swap(){ needs_swap_fixture "$MEM_FILE" "$SWAPS_FILE"; }
+ PLAN_SWAP=no
+ create_swap(){ printf 'create-swap\n' >> "$LOG"; [[ $TEST != memory-failure ]]; }
+ if [[ $TEST == memory-refuse ]]; then
+  if plan_low_memory <<< n; then exit 1; fi
+  [[ $(cat "$LOG") != *create-swap* ]] || exit 1
+ else
+  plan_low_memory <<< y || exit 1
+  [[ $(cat "$LOG") != *create-swap* ]] || exit 1
+  if [[ $TEST == memory-failure ]]; then
+   if execute_low_memory; then exit 1; fi
+  else execute_low_memory || exit 1; fi
+  if [[ $TEST == memory-high || $TEST == memory-existing-swap ]]; then [[ ! -s $LOG ]] || exit 1; fi
+ fi
 else
- cmd_node_add <<< 'y' > "$ROOT/$TEST.output"
+ preflight
+ if [[ $TEST == old-compose || $TEST == invalid-compose ]]; then
+  if check_node_environment; then exit 1; else assert test "$?" = 2; fi
+ elif [[ $TEST == ready || $TEST == optional-qr || $TEST == compose-v-prefix ]]; then
+  check_node_environment || exit 1
+  assert test "${#ENV_MISSING[@]}" = 0
+ else
+  if check_node_environment; then exit 1; else assert test "$?" = 1; fi
+  assert test "${#ENV_MISSING[@]}" -gt 0
+ fi
+ [[ $(cat "$LOG") != *FORBIDDEN* && $(cat "$LOG") != *confirmation* ]] || exit 1
 fi
-[[ ! -e $STACK_DIR && $(cat "$LOG") != *FORBIDDEN* ]]
-case "$TEST" in
- ready|optional-qr|memory-high|memory-existing-swap)
-  [[ $(cat "$LOG") == *node-type* && $(cat "$LOG") != *confirmation* && $(cat "$LOG") != *install-* && $(rg -c '^prepare-memory$' "$LOG") == 1 ]]
-  ;;
- missing-deps|missing-ca|no-docker|no-compose|stopped-daemon)
-  [[ $(rg -c '^confirmation$' "$LOG") == 1 && $(rg -c '^install-deps$' "$LOG") == 1 && $(rg -c '^install-docker$' "$LOG") == 1 ]]
-  [[ $(tail -1 "$LOG") == node-type && $(rg -c '^prepare-memory$' "$LOG") == 1 ]]
-  [[ $(cat "$ROOT/$TEST.output") == *'创建节点前需要补齐'* ]]
-  ;;
- refuse|eof|memory-refuse)
-  [[ $(cat "$LOG") == *confirmation* && $(cat "$LOG") != *install-* && $(cat "$LOG") != *node-type* ]]
-  ;;
- memory-create)
-  [[ $(rg -c '^confirmation$' "$LOG") == 1 && $(rg -c '^create-swap$' "$LOG") == 1 && $(cat "$LOG") == *node-type* && $(cat "$LOG") != *install-* ]]
-  ;;
- memory-failure)
-  [[ $(cat "$LOG") == *create-swap* && $(cat "$LOG") != *node-type* && $(cat "$LOG") != *install-* ]]
-  ;;
- install-failure)
-  [[ $(cat "$LOG") == *install-deps* && $(cat "$LOG") != *install-docker* && $(cat "$LOG") != *node-type* ]]
-  ;;
- recheck-failure)
-  [[ $(cat "$LOG") == *install-docker* && $(cat "$LOG") != *node-type* && $(cat "$ROOT/$TEST.output") == *'环境复检未通过'* ]]
-  ;;
- old-compose|invalid-compose)
-  [[ $(cat "$LOG") != *confirmation* && $(cat "$LOG") != *install-* && $(cat "$LOG") != *node-type* && $(cat "$ROOT/$TEST.output") == *'请手动升级'* ]]
-  ;;
- edit-no-install)
-  [[ $(cat "$LOG") != *confirmation* && $(cat "$LOG") != *install-* && $(cat "$LOG") != *node-type* ]]
-  ;;
-esac
+[[ ! -e $STACK_DIR ]] || exit 1
+
 BASH
  case "$test" in
   podman|unsupported-os) [[ $status == 1 && $(cat "$ROOT/$test.log") != *install-* && $(cat "$ROOT/$test.log") != *confirmation* && ! -e $ROOT/$test/stack ]] ;;

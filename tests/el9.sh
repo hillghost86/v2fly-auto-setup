@@ -146,14 +146,9 @@ case "$CASE" in
     if [[ $CASE == deps_minimal ]]; then assert not_contains 'dnf install -y curl';
     else assert contains 'dnf install -y curl ca-certificates openssl python3 iproute'; fi
     if [[ $CASE == deps_optional ]]; then
-      assert contains 'dnf install -y qrencode'
-      assert contains '跳过二维码'
-      assert contains 'confirm '
+      assert not_contains 'dnf install -y qrencode'
+      assert not_contains 'confirm '
       assert not_contains epel-release-latest-9.noarch.rpm
-      [[ $QR_INSTALL_ATTEMPTED == yes ]] || exit 1
-      prompts_before=$(awk '/^confirm /{n++} END{print n+0}' "$LOG")
-      if ensure_qrencode; then exit 1; fi
-      [[ $(awk '/^confirm /{n++} END{print n+0}' "$LOG") == "$prompts_before" ]] || exit 1
     fi
     if [[ $CASE == deps_qr_missing ]]; then assert contains 'qrencode 不可用'; assert not_contains 'confirm '; fi
     assert not_contains EPEL-release
@@ -162,13 +157,12 @@ case "$CASE" in
   epel_agree|epel_existing|epel_repo_fail|epel_tool_fail|epel_installed)
     HAVE_QR=no
     [[ $CASE != epel_installed ]] || HAVE_QR=yes
-    install_qrencode_el9 || exit 1
+    install_qrencode_el9 allow || exit 1
     case "$CASE" in
       epel_installed) assert test ! -s "$LOG" ;;
       epel_existing) assert not_contains 'confirm '; assert not_contains epel-release-latest-9.noarch.rpm; assert test "$QR_ATTEMPTS" = 2 ;;
       *)
-        assert contains 'confirm '
-        assert contains '外部软件源'
+        assert not_contains 'confirm '
         assert contains 'dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm'
         if [[ $CASE == epel_repo_fail ]]; then assert test "$QR_ATTEMPTS" = 1; assert contains 'EPEL 软件源安装失败';
         elif [[ $CASE == epel_tool_fail ]]; then assert contains 'qrencode 仍无法安装';
