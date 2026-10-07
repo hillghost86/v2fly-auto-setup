@@ -17,7 +17,7 @@ OLD=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 U=11111111-2222-4333-8444-555555555555
 step(){ :; }; grn(){ printf '%s\n' "$*"; }; ylw(){ printf '%s\n' "$*"; }; red(){ printf '%s\n' "$*"; }
 need_docker(){ :; }; sleep(){ :; }
-confirm(){ [[ $TEST != cancel ]]; }
+confirm(){ [[ $TEST != cancel && $TEST != qr-missing ]]; }
 docker(){
  printf '%s\n' "$*" >> "$LOG"
  if [[ $1 == inspect && ( $TEST == missing || $TEST == status-missing ) ]]; then return 1; fi

@@ -150,6 +150,10 @@ case "$CASE" in
       assert contains '跳过二维码'
       assert contains 'confirm '
       assert not_contains epel-release-latest-9.noarch.rpm
+      [[ $QR_INSTALL_ATTEMPTED == yes ]] || exit 1
+      prompts_before=$(awk '/^confirm /{n++} END{print n+0}' "$LOG")
+      if ensure_qrencode; then exit 1; fi
+      [[ $(awk '/^confirm /{n++} END{print n+0}' "$LOG") == "$prompts_before" ]] || exit 1
     fi
     if [[ $CASE == deps_qr_missing ]]; then assert contains 'qrencode 不可用'; assert not_contains 'confirm '; fi
     assert not_contains EPEL-release
