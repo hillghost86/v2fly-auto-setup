@@ -15,7 +15,6 @@ set -euo pipefail
 STACK_DIR=/root/v2fly-stack
 MIN_COMPOSE=2.23.1
 OS_FAMILY=""
-QR_INSTALL_ATTEMPTED=no
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -169,30 +168,72 @@ check_node_environment() {
   (( ${#ENV_MISSING[@]} == 0 ))
 }
 
-prepare_environment() {
-  prepare_low_memory || return 1
-  install_deps || return 1
-  install_docker || return 1
+workflow_step() { printf '\n------------------------------\n%s\n\n' "$*" >&2; }
+
+collect_environment_plan() {
+  PLAN_CORE=no PLAN_SWAP=no PLAN_QR=skip
+  local status
+  if check_node_environment; then :; else
+    status=$?
+    [[ $status != 2 ]] || return 1
+    PLAN_CORE=yes
+  fi
 }
 
-ensure_node_environment() {
+plan_low_memory() {
   local status
-  if check_node_environment; then
-    prepare_low_memory || return 1
-    return 0
-  else status=$?; fi
-  [[ $status != 2 ]] || return 1
-  ylw '创建节点前需要补齐以下环境：'
-  printf '  - %s\n' "${ENV_MISSING[@]}"
-  if ! confirm '是否初始化缺少的环境，然后继续新增节点？' n; then
-    ylw '已取消新增节点，未安装环境。'; return 1
+  if needs_swap; then
+    ylw '物理内存不足 1 GiB 且无活动 Swap，需要计划创建 1 GiB Swap。' >&2
+    confirm '是否计划创建 Swap 并写入 fstab？' n || { red '未安排必需的 Swap，已返回。' >&2; return 1; }
+    PLAN_SWAP=yes
+  else
+    status=$?
+    [[ $status == 1 ]] || return 1
   fi
-  prepare_environment || return 1
+}
+
+plan_qrencode() {
+  if command -v qrencode >/dev/null; then PLAN_QR=installed; return 0; fi
+  printf '%s\n' '二维码工具尚未安装：' '1) 安装；必要时允许添加 EPEL 9（仅 EL9）' '2) 仅使用现有软件源，失败跳过二维码' '3) 不安装，使用客户端链接' '0) 返回' >&2
+  local choice
+  choice=$(node_choice '二维码策略' 2 0123)
+  case $choice in 1) PLAN_QR=allow ;; 2) PLAN_QR=native ;; 3) PLAN_QR=skip ;; *) return 1 ;; esac
+}
+
+environment_summary() {
+  if [[ $PLAN_CORE == yes ]]; then printf '环境准备：\n'; printf '  - %s\n' "${ENV_MISSING[@]}";
+  else echo '核心依赖与 Docker 已就绪，无需安装或启动。'; fi
+  echo "Swap：$(if [[ $PLAN_SWAP == yes ]]; then echo '创建 1 GiB，启用并写入 fstab'; else echo '无需创建'; fi)"
+  case $PLAN_QR in
+    allow) echo '二维码：安装；必要时允许添加 EPEL 9（仅 EL9）' ;;
+    native) echo '二维码：仅现有软件源；失败跳过，不添加 EPEL' ;;
+    skip) echo '二维码：不安装' ;;
+    installed) echo '二维码：已安装，无需处理' ;;
+  esac
+}
+
+execute_low_memory() {
+  [[ $PLAN_SWAP == yes ]] || return 0
+  if ! create_swap; then
+    red "Swap 创建或持久化未完成，停止执行；已启用的 Swap 会保留。${SWAP_FSTAB_BACKUP:+ 备份：$SWAP_FSTAB_BACKUP}"
+    cleanup_swap
+    return 1
+  fi
+}
+
+execute_environment_plan() {
+  execute_low_memory || return 1
+  if [[ $PLAN_CORE == yes ]]; then
+    install_deps || return 1
+  fi
+  install_optional_qr "$PLAN_QR"
+  if [[ $PLAN_CORE == yes ]]; then install_docker || return 1; fi
   if ! check_node_environment; then
-    red '环境复检未通过，停止新增节点。'
+    red '环境复检未通过，停止执行。'
     if (( ${#ENV_MISSING[@]} )); then printf '  - %s\n' "${ENV_MISSING[@]}"; fi
     return 1
   fi
+  return 0
 }
 
 # Swap 的文件归属用本次临时文件的 inode 判断；已启用的文件绝不删除。
@@ -238,7 +279,7 @@ create_swap() {
   [[ ! -e $swap_file && ! -L $swap_file ]] || { red "$swap_file 已存在，不会覆盖；请自行检查 Swap"; return 1; }
   [[ -f $fstab_file && ! -L $fstab_file ]] || { red "$fstab_file 不是普通文件，停止创建 Swap"; return 1; }
   for tool in findmnt df dd mkswap swapon mktemp cp chmod ln mv cmp awk stat systemctl; do
-    command -v "$tool" >/dev/null || { red "缺少 $tool，无法安全创建 Swap；请自行准备，不会自动安装工具"; return 1; }
+    command -v "$tool" >/dev/null || { red "缺少 ${tool}，无法安全创建 Swap；请自行准备，不会自动安装工具"; return 1; }
   done
   while read -r entry rest || [[ -n $entry ]]; do
     [[ $entry != "$swap_file" ]] || { red "$fstab_file 已有 $swap_file 条目，请先自行核对"; return 1; }
@@ -269,7 +310,7 @@ create_swap() {
   swapon "$SWAP_TARGET" || { red "Swap 启用失败；fstab 备份：$SWAP_FSTAB_BACKUP"; return 1; }
   SWAP_ACTIVE=yes
   # swapon 返回成功后保留文件，后续失败不能通过 swapoff 增加内存压力。
-  swap_is_active "$SWAP_TARGET" "$SWAP_STATUS_FILE" || { red "无法确认 Swap 状态，请检查 $SWAP_TARGET；文件保留"; return 1; }
+  swap_is_active "$SWAP_TARGET" "$SWAP_STATUS_FILE" || { red "无法确认 Swap 状态，请检查 ${SWAP_TARGET}；文件保留"; return 1; }
   SWAP_FSTAB_CANDIDATE=$(mktemp "$fstab_file.v2fly-new.XXXXXX") || return 1
   cp --preserve=all -- "$fstab_file" "$SWAP_FSTAB_CANDIDATE" || { red "fstab 候选文件准备失败；备份：$SWAP_FSTAB_BACKUP"; return 1; }
   if command -v selinuxenabled >/dev/null && selinuxenabled; then
@@ -284,38 +325,29 @@ create_swap() {
   grn "✓ 1 GiB Swap 已启用，并写入 fstab；备份：$SWAP_FSTAB_BACKUP"
 }
 
-prepare_low_memory() {
-  local mem_file=${1:-/proc/meminfo} swaps_file=${2:-/proc/swaps} key value rest total="" entry
-  [[ -r $mem_file && -r $swaps_file ]] || { red "无法读取内存 / Swap 状态，停止安装"; return 1; }
+needs_swap() {
+  local mem_file=${1:-/proc/meminfo} swaps_file=${2:-/proc/swaps} key value rest total='' entry
+  [[ -r $mem_file && -r $swaps_file ]] || { red '无法读取内存 / Swap 状态。' >&2; return 2; }
   while read -r key value rest; do
     if [[ $key == MemTotal: ]]; then total=$value; break; fi
   done < "$mem_file"
-  [[ $total =~ ^[0-9]+$ ]] && (( total > 0 )) || { red "无法确定物理内存大小，停止安装"; return 1; }
-  (( total < 1048576 )) || return 0
+  [[ $total =~ ^[0-9]+$ ]] && (( total > 0 )) || { red '无法确定物理内存大小。' >&2; return 2; }
+  (( total < 1048576 )) || return 1
   while read -r entry rest; do
-    [[ -z $entry || $entry == Filename ]] || return 0
+    [[ -z $entry || $entry == Filename ]] || return 1
   done < "$swaps_file"
-  ylw "物理内存不足 1 GiB 且没有活动 Swap，安装依赖可能耗尽内存并导致 SSH 断连。"
-  if ! confirm "是否创建并启用 1 GiB Swap，写入 /etc/fstab 供重启后使用？" n; then
-    red "未创建 Swap，已停止此次安装。请先自行增加 Swap 或内存后重试。"
-    return 1
-  fi
-  if ! create_swap; then
-    red "Swap 创建或持久化未完成，停止安装；已启用的 Swap 会保留。${SWAP_FSTAB_BACKUP:+ fstab 备份：$SWAP_FSTAB_BACKUP}"
-    cleanup_swap
-    return 1
-  fi
 }
 
 install_qrencode_el9() {
+  local policy=${1:-native}
+  [[ $policy != skip ]] || return 0
   command -v qrencode >/dev/null && return 0
-  QR_INSTALL_ATTEMPTED=yes
   dnf install -y qrencode && return 0
+  if [[ $policy != allow ]]; then
+    ylw '现有软件源没有 qrencode；按计划跳过，不添加 EPEL。'
+    return 0
+  fi
   if ! rpm -q epel-release >/dev/null 2>&1; then
-    if ! confirm "当前源无可用 qrencode。是否添加 Fedora 官方 EPEL 9 外部软件源后安装二维码工具？" n; then
-      ylw "未添加 EPEL，跳过二维码；客户端链接仍可使用。"
-      return 0
-    fi
     if ! dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm; then
       ylw "EPEL 软件源安装失败，跳过二维码；客户端链接仍可使用。"
       return 0
@@ -341,10 +373,8 @@ install_deps() {
     if ((${#pkgs[@]})); then
       dnf install -y "${pkgs[@]}" || die "基础依赖安装失败"
     fi
-    install_qrencode_el9 || return 1
   else
-    command -v qrencode >/dev/null || QR_INSTALL_ATTEMPTED=yes
-    for p in curl ca-certificates qrencode openssl python3 iproute2; do
+    for p in curl ca-certificates openssl python3 iproute2; do
       dpkg -s "$p" &>/dev/null || pkgs+=("$p")
     done
     if ((${#pkgs[@]})); then
@@ -510,11 +540,18 @@ wait_for() {
 }
 
 cmd_init() {
+  local PLAN_CORE PLAN_SWAP PLAN_QR
   preflight
-  ylw '初始化将按需准备系统依赖、Docker / Compose；低内存机器可选择创建 Swap。'
-  confirm '确认初始化环境？' n || return 0
-  prepare_environment || return 1
-  grn '环境已就绪，请使用新增节点配置入口与出口。'
+  workflow_step '1 / 3 环境检查与计划'
+  collect_environment_plan || return 1
+  plan_low_memory || return 0
+  plan_qrencode || return 0
+  workflow_step '2 / 3 确认初始化计划'
+  environment_summary
+  confirm '确认执行以上环境计划？' n || return 0
+  workflow_step '3 / 3 执行初始化'
+  execute_environment_plan || return 1
+  grn '环境已就绪，请使用新增节点。'
 }
 
 # 元数据只按 JSON 解析，不执行配置中的代码。
@@ -747,8 +784,10 @@ def allocate_node():
         print(node_id)
 
 
-def create_node(node_id, address, front, outbound, port, path, user_id, image, remote_mode='', *remote_values):
-    node_id, address, port, path = ident(node_id), domain(address), local_port(port), ws_path(path)
+def build_node(node_id, address, front, outbound, port, path, user_id, image, remote_mode='', *remote_values):
+    port, path, user_id = resolve_defaults(port, path, user_id)
+    node_id = ident(node_id) if node_id != 'new' else node_id
+    address, port, path = domain(address), local_port(port), ws_path(path)
     if front not in ('nginx', 'caddy') or outbound not in ('direct', 'relay'):
         fail('入口或出口方式不正确')
     existing = allnodes()
@@ -773,8 +812,61 @@ def create_node(node_id, address, front, outbound, port, path, user_id, image, r
             node['remote'] = remote_config(*remote_values)
         else:
             fail('远端配置方式不正确')
+    return node
+
+
+def create_node(*args):
+    node = build_node(*args)
+    ident(node['id'])
     save_node(node)
     render_node(node)
+
+
+def validate_create(*args):
+    node = build_node(*args)
+    if node['outbound'] == 'relay':
+        remote = node['remote']
+        print(f"远端：{remote['domain']}:{remote['port']}{remote['path']}；Host={remote['host']}；SNI={remote['sni']}")
+
+
+def resolve_defaults(port, path, user_id):
+    if port == 'auto':
+        import socket
+        used = {node['port'] for node in allnodes()}
+        for candidate in range(2333, 65536):
+            if candidate in used:
+                continue
+            with socket.socket() as sock:
+                try:
+                    sock.bind(('127.0.0.1', candidate))
+                except OSError:
+                    continue
+            port = str(candidate)
+            break
+        else:
+            fail('没有可用本地端口')
+    return port, '/' + uuid.uuid4().hex[:12] if path == 'auto' else path, str(uuid.uuid4()) if user_id == 'auto' else user_id
+
+
+def print_defaults(*args):
+    for value in resolve_defaults(*args):
+        print(value)
+
+
+def validate_link(link):
+    parse_remote_link(link)
+
+
+def validate_path(node_id, address, path):
+    address, path = domain(address), ws_path(path)
+    if any(node['id'] != node_id and node['domain'] == address and node['path'] == path for node in allnodes()):
+        fail('入口路径已被其他节点使用')
+
+
+def validate_port(node_id, port):
+    port = local_port(port)
+    if any(node['id'] != node_id and node['port'] == port for node in allnodes()):
+        fail('本地端口已被其他节点使用')
 
 
 def get_node(node_id, field):
@@ -829,6 +921,11 @@ HANDLERS = {
     'validate-label': lambda value: print(label_name(value)),
     'validate-domain': lambda value: print(domain(value.strip())),
     'create': create_node,
+    'validate-create': validate_create,
+    'defaults': print_defaults,
+    'validate-link': validate_link,
+    'validate-port': validate_port,
+    'validate-path': validate_path,
     'get': get_node,
     'fields': node_fields,
     'list': list_nodes,
@@ -894,6 +991,7 @@ node_ingress_apply() {
 node_hint() {
   local d p port
   d=$(node_get domain); p=$(node_get path); port=$(node_get port)
+  workflow_step 'Nginx：待手工配置'
   echo "请在 $d 的 HTTPS server 块加入以下内容并重载 Nginx："
   cat <<EOF
     location = $p {
@@ -917,12 +1015,13 @@ node_owner() {
 
 node_ask() {
   local reply
+  printf '\n' >&2
   read -r -u "$IN" -p "$1${2:+ [$2]}: " reply || return 1
   printf '%s' "${reply:-$2}"
 }
 
 node_option() {
-  if [[ $advanced == yes ]]; then ask "$1" "$2"; else printf '%s' "$2"; fi
+  if [[ $advanced == yes ]]; then node_input "$3" "$1" "$2"; else printf '%s' "$2"; fi
 }
 
 node_select() {
@@ -960,7 +1059,8 @@ node_ingress_select() {
   local entry domain choice listing i=0 default='' current_domain='' current_front='' busy=no
   local domains=() fronts=()
   if [[ $edit == yes ]]; then current_domain=$(node_get domain); current_front=$(node_get front); fi
-  listing=$(node_python entries) || return 1
+  if command -v python3 >/dev/null; then listing=$(node_python entries) || return 1;
+  else listing=''; ylw '尚无 Python，无法列出已登记入口；环境就绪后会再次检查冲突。' >&2; fi
   while IFS=$'\t' read -r domain front; do
     [[ -n $domain ]] || continue
     domains+=("$domain"); fronts+=("$front"); i=$((i+1))
@@ -982,48 +1082,37 @@ node_ingress_select() {
     if [[ ! $choice =~ ^[1-9][0-9]*$ ]] || (( ${#choice} >= 10 || choice > nginx )); then ylw '选择无效，请输入列表中的编号。'; continue; fi
     if (( choice <= i )); then d=${domains[choice-1]}; front=${fronts[choice-1]}; return; fi
     if (( choice == caddy )); then front=caddy; else front=nginx; fi
+    if (( i > 0 )) && [[ $front != ${fronts[0]} ]]; then
+      ylw '已有节点使用另一种 HTTPS 管理方式，请重新选择兼容的入口。' >&2
+      continue
+    fi
     if [[ $front == caddy && $busy == yes ]] && ! container_running v2ray-ingress; then
       ylw '80/443 已被占用，请选择已有 Nginx 或复用已登记入口。'; continue
     fi
     while true; do
-      d=$(node_ask '入口域名（0 返回）' "$current_domain") || return 1
-      [[ $d != 0 ]] || return 1
-      if d=$(node_python validate-domain "$d"); then return; fi
+      d=$(node_input domain '入口域名' "$current_domain") || return 1
+      return
     done
   done
 }
 
-ensure_qrencode() {
+install_optional_qr() {
+  local policy=$1
+  [[ $policy == allow || $policy == native ]] || return 0
   command -v qrencode >/dev/null && return 0
-  if [[ $QR_INSTALL_ATTEMPTED == yes ]]; then
-    ylw '本次已尝试安装二维码工具，继续使用客户端链接。'; return 1
+  if [[ $OS_FAMILY == el9 ]]; then
+    install_qrencode_el9 "$policy" || ylw '二维码工具安装失败，继续使用链接。'
+  elif ! apt-get update -qq || ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; then
+    ylw '二维码工具安装失败，继续使用链接。'
   fi
-  ylw '缺少二维码工具 qrencode；复制客户端链接仍可使用。'
-  confirm '是否安装二维码工具？' n || return 1
-  QR_INSTALL_ATTEMPTED=yes
-  local family=${OS_FAMILY:-}
-  if [[ -z $family ]]; then
-    family=$(detect_os && printf '%s' "$OS_FAMILY") || { ylw '无法确定支持的系统，跳过二维码安装。'; return 1; }
-  fi
-  [[ $family == el9 || $family == debian ]] || { ylw '当前系统不支持二维码工具自动安装，请使用链接。'; return 1; }
-  prepare_low_memory || return 1
-  case $family in
-    el9) install_qrencode_el9 || { ylw '二维码工具安装失败，请使用链接。'; return 1; } ;;
-    debian)
-      if ! apt-get update -qq || ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; then
-        ylw '二维码工具安装失败，请使用链接。'; return 1
-      fi
-      ;;
-    *) ylw '当前系统不支持二维码工具自动安装，请使用链接。'; return 1 ;;
-  esac
-  if ! command -v qrencode >/dev/null; then
-    ylw '二维码工具仍不可用，请使用客户端链接。'; return 1
-  fi
+  return 0
 }
 
 show_qr() {
   local link=$1 cols width level selected='' output
-  ensure_qrencode || return 0
+  if ! command -v qrencode >/dev/null; then
+    ylw '未安装 qrencode，已保留客户端链接；可在初始化环境中选择安装。'; return 0
+  fi
   cols=$(tput cols 2>/dev/null || printf 80)
   [[ $cols =~ ^[0-9]+$ ]] || cols=80
   for level in M L; do
@@ -1046,7 +1135,9 @@ show_qr() {
 node_show() {
   local link
   link=$(node_python link "$NODE_ID") || return 1
+  workflow_step '客户端链接'
   echo "$link"
+  workflow_step '二维码'
   [[ ${1:-auto} == plain ]] || show_qr "$link"
   [[ $(node_get front) != nginx ]] || node_hint
 }
@@ -1137,76 +1228,133 @@ node_recover() {
   ylw "已恢复；变更备份保留在 $backup"
 }
 
+node_input() {
+  local kind=$1 prompt=$2 default=${3:-} value valid
+  while true; do
+    value=$(node_ask "${prompt}（0 返回）" "$default") || return 1
+    [[ $value != 0 ]] || return 1
+    valid=no
+    case $kind in
+      label)
+        value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [[ -n $value && ${#value} -le 80 && ! $value =~ [[:cntrl:]] ]] && valid=yes ;;
+      domain)
+        [[ $value =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ && $value == *.* && $value != *..* ]] && valid=yes ;;
+      port|remote-port)
+        if [[ $value == auto && $kind == port ]]; then valid=yes
+        elif [[ $value =~ ^[0-9]{1,5}$ ]]; then
+          local minimum=1024 number=$((10#$value))
+          [[ $kind != remote-port ]] || minimum=1
+          (( number >= minimum && number <= 65535 )) && valid=yes
+          [[ $valid != yes ]] || value=$number
+        fi ;;
+      path|remote-path) [[ ( $kind == path && $value == auto ) || $value =~ ^/[A-Za-z0-9._~-]+$ ]] && valid=yes ;;
+      uuid|remote-uuid) [[ ( $kind == uuid && $value == auto ) || $value =~ ^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$ ]] && valid=yes ;;
+      image) [[ $value =~ ^[A-Za-z0-9_.-]+$ || $value =~ ^sha256:[a-f0-9]{64}$ ]] && valid=yes ;;
+      vmess)
+        if [[ $value == vmess://* && ${#value} -gt 8 ]]; then
+          if ! command -v python3 >/dev/null || node_python validate-link "$value"; then valid=yes; fi
+        fi ;;
+    esac
+    if [[ $valid == yes ]]; then printf '%s' "$value"; return 0; fi
+    ylw '输入无效，请重新填写当前字段。' >&2
+  done
+}
+
 cmd_node_add() {
-  local edit=${1:-no} d front out p ws u image mode link rd rp ru rw oldimage='' backup existed=no label advanced=no previousimage='' rh rs
+  local edit=${1:-no} d front out p ws u image mode link rd rp ru rw oldimage='' backup existed=no label advanced=no previousimage='' rh rs remote_info='' defaults field
+  local PLAN_CORE PLAN_SWAP PLAN_QR
+  local remote_args=() values=()
+  workflow_step '1 / 10 只读环境检查'
   preflight
-  if [[ $edit == no ]]; then
-    ensure_node_environment || return 1
-  else
-    need_docker
-    local tool
-    for tool in python3 curl openssl ss; do
-      command -v "$tool" >/dev/null || { red "缺少 ${tool}，请先运行初始化环境。"; return 1; }
-    done
-  fi
+  collect_environment_plan || return 1
   if [[ $edit == yes ]]; then
+    command -v python3 >/dev/null || { red '编辑已有节点需要 Python，请先初始化环境。'; return 1; }
     existed=yes; previousimage=$(node_get image) || return 1
     out=$(node_get outbound) || return 1
   else NODE_ID=''; out=direct; fi
+  workflow_step '2 / 10 节点类型'
   printf '%s\n' '1) 本机节点（本机直出）' '2) 中转节点（通过远端节点出网）' '0) 返回'
   mode=$(node_choice '节点类型' "$(if [[ $out == relay ]]; then echo 2; else echo 1; fi)" '012')
-  case $mode in
-    1) out=direct ;;
-    2) out=relay ;;
-    0) return 0 ;;
-  esac
-  while true; do
-    label=$(node_ask '节点名称，例如 韩国直出 / 韩国转日本（0 返回）' "$(if [[ $edit == yes ]]; then node_get label 2>/dev/null || node_get id; fi)") || return 0
-    [[ $label != 0 ]] || return 0
-    if label=$(node_python validate-label "$label"); then break; fi
-  done
+  case $mode in 1) out=direct ;; 2) out=relay ;; *) return 0 ;; esac
+  workflow_step '3 / 10 节点名称'
+  label=$(node_input label '节点名称，例如 韩国直出 / 韩国转日本' "$(if [[ $edit == yes ]]; then node_get label 2>/dev/null || node_get id; fi)") || return 0
+  workflow_step '4 / 10 HTTPS 入口'
   node_ingress_select || return 0
-  if confirm '是否修改高级设置（端口、UUID、路径、镜像）？' n; then advanced=yes; fi
-  p=$(node_option '本地端口' "$(if [[ $edit == yes ]]; then node_get port; else python3 - "$STACK_DIR" <<'PY'
-import sys,json,pathlib,socket
-used=set()
-for p in (pathlib.Path(sys.argv[1])/'nodes').glob('*/metadata.json'):used.add(json.loads(p.read_text())['port'])
-for port in range(2333,65536):
- if port in used:continue
- s=socket.socket()
- try:s.bind(('127.0.0.1',port));print(port);break
- except OSError:pass
- finally:s.close()
-PY
-fi)")
-  if [[ $edit != yes || $p != $(node_get port) ]] && port_in_use "$p"; then red '本地端口已被占用'; return 1; fi
-  ws=$(node_option 'WebSocket 路径' "$(if [[ $edit == yes ]]; then node_get path; else printf '/%s' "$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"; fi)")
-  u=$(node_option 'UUID' "$(if [[ $edit == yes ]]; then node_get uuid; else python3 -c 'import uuid;print(uuid.uuid4())'; fi)")
-  image=$(node_option 'V2Fly 镜像标签' "$(if [[ $edit == yes ]]; then node_get image | sed 's|v2fly/v2fly-core:||'; else echo latest; fi)"); [[ $image == sha256:* ]] || image="v2fly/v2fly-core:$image"
-  local remote_args=()
+  workflow_step '5 / 10 高级设置'
+  while true; do
+    mode=$(node_ask '是否修改高级设置（y/N，0 返回）' n) || return 0
+    case $mode in y|Y) advanced=yes; break ;; n|N) break ;; 0) return 0 ;; *) ylw '请输入 y、n 或 0。' >&2 ;; esac
+  done
+  local port_default
+  port_default=$(if [[ $edit == yes ]]; then node_get port; else echo auto; fi)
+  while true; do
+    p=$(node_option '本地端口' "$port_default" port) || return 0
+    if [[ $p != auto ]] && command -v ss >/dev/null && { [[ $edit == no ]] || [[ $p != $(node_get port) ]]; } && port_in_use "$p"; then
+      ylw '本地端口已被占用，请重新填写当前字段。' >&2
+    elif [[ $p != auto ]] && command -v python3 >/dev/null && ! node_python validate-port "${NODE_ID:-new}" "$p"; then
+      ylw '此端口已登记到其他节点，请重新填写。' >&2
+    else break; fi
+    advanced=yes; port_default=$p
+  done
+  local path_default
+  path_default=$(if [[ $edit == yes ]]; then node_get path; else echo auto; fi)
+  while true; do
+    ws=$(node_option 'WebSocket 路径' "$path_default" path) || return 0
+    if [[ $ws != auto ]] && command -v python3 >/dev/null && ! node_python validate-path "${NODE_ID:-new}" "$d" "$ws"; then
+      ylw '入口路径冲突，请重新填写当前字段。' >&2
+      advanced=yes; path_default=$ws
+    else break; fi
+  done
+  u=$(node_option 'UUID' "$(if [[ $edit == yes ]]; then node_get uuid; else echo auto; fi)" uuid) || return 0
+  image=$(node_option 'V2Fly 镜像标签' "$(if [[ $edit == yes ]]; then node_get image | sed 's|v2fly/v2fly-core:||'; else echo latest; fi)" image) || return 0
+  [[ $image == sha256:* ]] || image="v2fly/v2fly-core:$image"
+  workflow_step '6 / 10 远端出口'
   if [[ $out == relay ]]; then
-      printf '%s\n' '1) 导入 vmess:// 链接' '2) 手动填写'
-      local remote_choices=012
-      if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo '3) 保留现有远端'; remote_choices=0123; fi
-      echo '0) 返回'
-      mode=$(node_choice '远端配置' "$(if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo 3; else echo 1; fi)" "$remote_choices")
-      [[ $mode != 0 ]] || return 0
-      if [[ $mode == 1 ]]; then link=$(ask '日本节点 vmess:// 链接' ''); remote_args=(link "$link")
-      elif [[ $mode == 2 ]]; then
-        rd=$(ask '远端域名' ''); rp=$(ask '远端端口' '443'); ru=$(ask '远端 UUID' ''); rw=$(ask '远端 WS 路径' '')
-        rh=$(ask '远端 WebSocket Host' "$rd"); rs=$(ask '远端 TLS SNI' "$rd")
+    printf '%s\n' '1) 导入 vmess:// 链接' '2) 手动填写'
+    local remote_choices=012 remote_default=1
+    if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo '3) 保留现有远端'; remote_choices=0123; remote_default=3; fi
+    echo '0) 返回'
+    mode=$(node_choice '远端配置' "$remote_default" "$remote_choices")
+    case $mode in
+      1) link=$(node_input vmess '远端 vmess:// 链接' '') || return 0; remote_args=(link "$link"); remote_info='从已填写的 vmess 链接导入（环境就绪后校验）' ;;
+      2)
+        rd=$(node_input domain '远端域名' '') || return 0
+        rp=$(node_input remote-port '远端端口' 443) || return 0
+        ru=$(node_input remote-uuid '远端 UUID' '') || return 0
+        rw=$(node_input remote-path '远端 WS 路径' '') || return 0
+        rh=$(node_input domain '远端 WebSocket Host' "$rd") || return 0
+        rs=$(node_input domain '远端 TLS SNI' "$rd") || return 0
         remote_args=(manual "$rd" "$rp" "$ru" "$rw" "$rh" "$rs")
-      elif [[ $mode == 3 && $edit == yes && $(node_get outbound) == relay ]]; then
-        remote_args=(preserve)
-      else return 1; fi
+        remote_info="远端：${rd}:${rp}${rw}；Host=${rh}；SNI=$rs" ;;
+      3) remote_args=(preserve); remote_info='保留现有远端配置' ;;
+      *) return 0 ;;
+    esac
+  else echo '本机直出，无需填写远端。'; fi
+  if command -v python3 >/dev/null; then
+    remote_info=$(node_python validate-create "${NODE_ID:-new}" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" ${remote_args[@]+"${remote_args[@]}"}) || return 1
   fi
-  echo "节点 ${label} (${NODE_ID:-自动编号})；入口 ${d}${ws} (${front})；本地端口 ${p}；出口 ${out}"
-  [[ $front != nginx ]] || ylw '创建后仍需手动添加 Nginx 路径配置。'
-  confirm '确认应用此节点？' n || return 0
-  open_firewall "$front" || return 1
+  workflow_step '7 / 10 环境准备计划'
+  plan_low_memory || return 0
+  plan_qrencode || return 0
+  workflow_step '8 / 10 最终确认'
+  printf '节点名称：%s\n类型：%s\n入口：%s（%s）\n路径：%s\n本地端口：%s\nUUID：%s\n镜像：%s\n' "$label" "$(if [[ $out == direct ]]; then echo 本机直出; else echo 远端中转; fi)" "$d" "$(if [[ $front == nginx ]]; then echo 已有Nginx; else echo Caddy; fi)" "$(if [[ $ws == auto ]]; then echo 自动生成; else echo "$ws"; fi)" "$(if [[ $p == auto ]]; then echo 自动分配; else echo "$p"; fi)" "$(if [[ $u == auto ]]; then echo 自动生成; else echo "$u"; fi)" "$image"
+  [[ -z $remote_info ]] || echo "$remote_info"
+  environment_summary
+  if [[ $front == nginx ]]; then ylw 'Nginx 状态：创建后待手工配置 HTTPS 转发。';
+  else echo '防火墙：为 Caddy 放行 80/443（仅修改已启用的防火墙）。'; fi
+  confirm '确认执行以上全部计划？' n || return 0
+  workflow_step '9 / 10 执行准备与创建'
+  execute_environment_plan || return 1
+  defaults=$(node_python defaults "$p" "$ws" "$u") || return 1
+  while IFS= read -r field; do values+=("$field"); done <<< "$defaults"
+  p=${values[0]}; ws=${values[1]}; u=${values[2]}
+  remote_info=$(node_python validate-create "${NODE_ID:-new}" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" ${remote_args[@]+"${remote_args[@]}"}) || return 1
+  [[ -z $remote_info ]] || echo "$remote_info"
   if [[ $edit == no ]]; then NODE_ID=$(node_python allocate) || return 1; fi
-  mkdir -p "$STACK_DIR/nodes"; chmod 700 "$STACK_DIR/nodes"
   node_owner "v2ray-node-$NODE_ID" "v2ray-node-$NODE_ID" || return 1
+  open_firewall "$front" || return 1
+  mkdir -p "$STACK_DIR/nodes"; chmod 700 "$STACK_DIR/nodes"
   backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX"); chmod 700 "$backup"
   if [[ $existed == yes ]]; then
     cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
@@ -1218,26 +1366,23 @@ fi)")
     image=$oldimage
   fi
   if ! node_python create "$NODE_ID" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" ${remote_args[@]+"${remote_args[@]}"}; then
-    if [[ $existed == yes ]]; then
-      node_restore_files "$backup" || return 1
-    else rm -rf "$STACK_DIR/nodes/$NODE_ID"; fi
+    if [[ $existed == yes ]]; then node_restore_files "$backup" || return 1; else rm -rf "$STACK_DIR/nodes/$NODE_ID"; fi
     NODE_TX_ACTIVE=no
     return 1
   fi
-  # 下载镜像为明确的创建节点操作所需，不涉及主机依赖安装。
   if [[ $image != sha256:* ]] && ! node_compose pull -q v2ray; then
     NODE_TX_ACTIVE=no
     if [[ $existed == yes ]]; then node_restore_files "$backup"; else rm -rf "$STACK_DIR/nodes/$NODE_ID"; fi
-    red "拉取失败，旧节点未改变；备份：$backup"; return 1
+    red "拉取失败，原节点未改变；备份：$backup"; return 1
   fi
   if ! node_python label "$NODE_ID" "$label"; then node_recover "$backup" "$oldimage" "$existed"; return 1; fi
-  if ! node_apply "$backup" "$oldimage" "$existed"; then return 1; fi
+  node_apply "$backup" "$oldimage" "$existed" || return 1
   NODE_TX_ACTIVE=no
   rm -rf "$backup"
+  workflow_step '10 / 10 创建结果'
+  if [[ $front == nginx ]]; then grn '节点本地服务已就绪；Nginx HTTPS 转发待手工配置。'; else grn '节点配置与链路自检已通过。'; fi
   node_show
-  grn '节点配置已应用。分别导入各节点链接，在客户端切换。'
 }
-
 cmd_node_manage() {
   need_docker; node_select || return 1
   printf '%s\n' '1) 链接/二维码' '2) 修改' '3) 测试连接' '4) 日志' '5) 重启' '6) 删除' '7) 更新镜像' '0) 返回'
@@ -1405,7 +1550,7 @@ cmd_nodes_status() {
 node_menu() {
   echo '======== V2Fly 多节点管理 ========'
   if command -v python3 >/dev/null; then node_python list || return 1;
-  else ylw '尚未准备 Python，请选择初始化环境。'; fi
+  else ylw '尚无 Python；可以先填写新增节点，最终确认后统一准备环境。'; fi
   printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 删除节点' '6) 初始化环境' '7) 更新共享 Caddy' '0) 退出'
   case "$(node_choice '请选择' '0' '01234567')" in
     1) cmd_node_add ;;

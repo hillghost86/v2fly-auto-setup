@@ -122,20 +122,29 @@ systemctl(){ printf 'systemctl %s\n' "$*" >> "$LOG"; [[ $CASE != reload_fail ]];
 # 让真实安装入口只会调用 fixture 文件。
 eval "$(declare -f create_swap | sed '1s/create_swap/create_swap_fixture/')"
 create_swap(){ create_swap_fixture "$TARGET" "$FSTAB"; }
+# Fixture bridge: planning may ask, actual execute_low_memory never reads input.
+fixture_prepare_swap(){
+  local status PLAN_SWAP=no
+  if needs_swap "$1" "$2"; then
+    confirm '计划创建 Swap？' n || return 1
+    PLAN_SWAP=yes
+    execute_low_memory
+  else status=$?; [[ $status == 1 ]]; fi
+}
 case "$CASE" in
   enough)
     printf 'MemTotal: 2097152 kB\n' > "$MEM"
-    prepare_low_memory "$MEM" "$SWAPS" || exit 1
+    fixture_prepare_swap "$MEM" "$SWAPS" || exit 1
     assert test ! -s "$LOG"
     ;;
   existing_swap)
     printf '/existing-swap file 1048576 0 -2\n' >> "$SWAPS"
-    prepare_low_memory "$MEM" "$SWAPS" || exit 1
+    fixture_prepare_swap "$MEM" "$SWAPS" || exit 1
     assert test ! -s "$LOG"
     ;;
   decline)
     IN=0
-    if prepare_low_memory "$MEM" "$SWAPS" </dev/null; then exit 1; fi
+    if fixture_prepare_swap "$MEM" "$SWAPS" </dev/null; then exit 1; fi
     assert not_contains dd
     assert not_contains findmnt
     ;;
@@ -148,7 +157,7 @@ case "$CASE" in
       fstab_conflict) printf '%s none swap defaults 0 0\n' "$TARGET" >> "$FSTAB"; /bin/cp "$FSTAB" "$DIR/expected" ;;
     esac
     if [[ $CASE == success ]]; then
-      prepare_low_memory "$MEM" "$SWAPS" || exit 1
+      fixture_prepare_swap "$MEM" "$SWAPS" || exit 1
       assert test "$SWAP_ACTIVE" = yes
       assert contains 'bs=1M count=1024 conv=fsync'
       assert contains 'restorecon '
@@ -164,7 +173,7 @@ positions=[next(i for i,s in enumerate(lines) if s.startswith(prefix)) for prefi
 assert positions==sorted(positions)
 PY
     else
-      if prepare_low_memory "$MEM" "$SWAPS"; then exit 1; fi
+      if fixture_prepare_swap "$MEM" "$SWAPS"; then exit 1; fi
       case "$CASE" in
         candidate_fail|context_fail|persist_fail|reload_fail)
           assert test "$SWAP_ACTIVE" = yes

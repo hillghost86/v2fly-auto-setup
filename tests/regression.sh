@@ -14,7 +14,9 @@ step(){ :; }; grn(){ :; }; ylw(){ :; }; red(){ :; }
 LOG="$ROOT/effects"
 # 初始化拒绝与接受：仅准备环境，不创建节点或改防火墙。
 preflight(){ printf 'preflight\n' >> "$LOG"; }
-prepare_low_memory(){ printf 'memory\n' >> "$LOG"; }
+collect_environment_plan(){ PLAN_CORE=yes; PLAN_SWAP=yes; PLAN_QR=skip; ENV_MISSING=(deps); }
+plan_low_memory(){ :; }; plan_qrencode(){ :; }; check_node_environment(){ return 0; }
+execute_low_memory(){ printf 'memory\n' >> "$LOG"; }
 install_deps(){ printf 'deps\n' >> "$LOG"; }
 install_docker(){ printf 'docker\n' >> "$LOG"; }
 open_firewall(){ printf 'FORBIDDEN firewall\n' >> "$LOG"; return 1; }

@@ -10,6 +10,8 @@ bash <<'TEST'
 set -euo pipefail
 source "$SCRIPT"
 ORIGINAL_INGRESS=$(declare -f node_ingress_apply)
+collect_environment_plan(){ PLAN_CORE=no; PLAN_SWAP=no; PLAN_QR=installed; }
+plan_low_memory(){ :; }; plan_qrencode(){ PLAN_QR=installed; }; execute_environment_plan(){ :; }
 STACK_DIR="$ROOT/stack"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
 mkdir -p "$STACK_DIR"
 U=11111111-2222-4333-8444-555555555555
@@ -106,7 +108,7 @@ echo 'PASS rollback-original-image-and-target-scope'
   STACK_DIR="$ROOT/interactive"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
   NODE_ID=2
   node_python create 2 1.example.com nginx relay 2335 /2 "$U" v2fly/v2fly-core:5.41.0 manual 2.example.com 443 "$U" /remote
-  preflight(){ :; }; ensure_node_environment(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }; open_firewall(){ :; }
+  preflight(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }; open_firewall(){ :; }
   docker(){ if [[ $* == *'{{.Image}}'* ]]; then echo sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; elif [[ $1 == inspect ]]; then return 1; fi; }
   node_ask(){ printf '%s' "$2"; }
   confirm(){ [[ $1 != *'高级设置'* ]]; }
@@ -172,7 +174,7 @@ echo 'PASS rollback-original-image-and-target-scope'
 # 使用真实 read 模拟输入，避免 ask 的子 shell 丢失队列状态。
 (
  STACK_DIR="$ROOT/fresh-menu"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
- preflight(){ :; }; ensure_node_environment(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }; open_firewall(){ :; }
+ preflight(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }; open_firewall(){ :; }
  docker(){ if [[ $1 == inspect ]]; then return 1; fi; }
  node_apply(){ :; }; node_show(){ :; }
  cmd_node_add > "$ROOT/fresh-menu.log" <<'INPUT'
@@ -233,7 +235,7 @@ INPUT
  if node_ingress_select <<<'0'; then exit 1; fi
  if node_ingress_select </dev/null; then exit 1; fi
  node_select </dev/null && exit 1
- preflight(){ :; }; ensure_node_environment(){ :; }; need_docker(){ :; }; ss(){ :; }; docker(){ :; }; open_firewall(){ :; }
+ preflight(){ :; }; need_docker(){ :; }; ss(){ :; }; docker(){ :; }; open_firewall(){ :; }
  cmd_node_add </dev/null
  [[ ! -e $STACK_DIR ]]
  echo 'PASS fresh-busy-default-and-no-write-on-return'
@@ -242,7 +244,7 @@ INPUT
 # 新建第一问类型，编辑保留原类型；返回时不创建文件。
 (
  STACK_DIR="$ROOT/type-first"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
- preflight(){ :; }; ensure_node_environment(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }; open_firewall(){ :; }
+ preflight(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }; open_firewall(){ :; }
  docker(){ if [[ $1 == inspect ]]; then return 1; fi; }
  node_apply(){ :; }; node_show(){ :; }
  node_ask(){ printf '%s\n' "$1" >> "$ROOT/type-prompts"; ask "$@"; }

@@ -12,14 +12,14 @@
 
 - 在独立特性分支修改；默认远程分支为 `main`。
 - 基础语法检查：`bash -n v2fly-auto-setup.sh`。
-- 模拟回归检查：`bash tests/regression.sh`、`bash tests/el9.sh`、`bash tests/swap.sh`、`bash tests/nodes.sh`、`bash tests/management.sh`、`bash tests/environment.sh` 和 `bash tests/qr-install.sh`，无需 Docker 服务或额外测试框架。
+- 模拟回归检查：`bash tests/regression.sh`、`bash tests/el9.sh`、`bash tests/swap.sh`、`bash tests/nodes.sh`、`bash tests/management.sh`、`bash tests/environment.sh`、`bash tests/qr-install.sh` 和 `bash tests/workflow.sh`，无需 Docker 服务或额外测试框架。
 - 本地验证使用模拟的 Docker、APT、DNF、防火墙和网络命令，不能直接运行脚本的安装、更新或卸载子命令。
 - 模拟检查不能代替 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 和 CentOS Stream 9 上的真实部署验证，交付时明确未验证范围。
 - 安装依赖、真实容器操作及服务器部署需另行获得用户授权。
 
 ## 恢复与资源归属
 
-- 环境初始化保留独立入口；新增节点先只读检查，缺少环境时经确认调用初始化并复检，成功才继续。核心依赖已就绪不得重复安装，但新增仍须检查内存 / Swap；初始化或必需 Swap 准备被拒绝、失败时不得创建节点。二维码工具缺失时提供可选安装，拒绝或失败不影响链接和已创建节点。修改初始化流程时覆盖已有 Docker、缺少 Compose 和首次安装，节点流程覆盖创建、修改、更新、删除及失败恢复。
+- 新增节点和独立初始化均按“只读检查与输入 → 汇总确认 → 集中执行 → 结果展示”组织。所有安装、Swap、EPEL 选择须在最终确认前完成，执行阶段不得再读取交互输入。取消或 EOF 不写节点、不安装。查看链接/二维码只展示，缺工具提示去初始化环境。低内存检查覆盖依赖已齐全的机器，保留原 Swap 安全保护和节点失败恢复。
 - 节点操作只重建目标 V2Fly 容器；共享入口更新必须检查资源归属，并明确连接重连影响。
 - 清理只处理本次创建的资源；失败恢复使用变更前的配置和镜像，不依赖可变标签仍指向旧版本。
 - 恢复失败时保留备份并明确报告；临时配置及备份中的 UUID 按凭据保护。
