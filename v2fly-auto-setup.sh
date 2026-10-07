@@ -133,6 +133,64 @@ need_docker() {
   docker info >/dev/null 2>&1 || die "Docker 没有运行，请执行: systemctl start docker"
 }
 
+has_ca_certificates() {
+  if [[ $OS_FAMILY == el9 ]]; then
+    rpm -q ca-certificates >/dev/null 2>&1
+  else
+    dpkg -s ca-certificates 2>/dev/null | grep -q '^Status: install ok installed'
+  fi
+}
+
+# 只读检查；缺项返回 1，不可自动修复的情况返回 2。
+check_node_environment() {
+  ENV_MISSING=()
+  local tool version
+  for tool in python3 curl openssl ss ip; do
+    command -v "$tool" >/dev/null || ENV_MISSING+=("命令 $tool")
+  done
+  has_ca_certificates || ENV_MISSING+=(ca-certificates)
+  if ! command -v docker >/dev/null; then
+    ENV_MISSING+=("Docker Engine / Docker Compose")
+  else
+    check_docker_engine
+    if ! docker compose version >/dev/null 2>&1; then
+      ENV_MISSING+=("Docker Compose")
+    else
+      version=$(docker compose version --short 2>/dev/null | sed 's/^v//') || version=''
+      if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || \
+          [[ "$(printf '%s\n%s\n' "$MIN_COMPOSE" "$version" | sort -V | head -1)" != "$MIN_COMPOSE" ]]; then
+        red "Docker Compose 版本 ${version:-无法识别}，需要 $MIN_COMPOSE 以上；请手动升级后重试，脚本不会升级已有 Compose。"
+        return 2
+      fi
+    fi
+    docker info >/dev/null 2>&1 || ENV_MISSING+=("Docker 服务未运行")
+  fi
+  (( ${#ENV_MISSING[@]} == 0 ))
+}
+
+prepare_environment() {
+  prepare_low_memory || return 1
+  install_deps || return 1
+  install_docker || return 1
+}
+
+ensure_node_environment() {
+  local status
+  if check_node_environment; then return 0; else status=$?; fi
+  [[ $status != 2 ]] || return 1
+  ylw '创建节点前需要补齐以下环境：'
+  printf '  - %s\n' "${ENV_MISSING[@]}"
+  if ! confirm '是否初始化缺少的环境，然后继续新增节点？' n; then
+    ylw '已取消新增节点，未安装环境。'; return 1
+  fi
+  prepare_environment || return 1
+  if ! check_node_environment; then
+    red '环境复检未通过，停止新增节点。'
+    if (( ${#ENV_MISSING[@]} )); then printf '  - %s\n' "${ENV_MISSING[@]}"; fi
+    return 1
+  fi
+}
+
 # Swap 的文件归属用本次临时文件的 inode 判断；已启用的文件绝不删除。
 swap_is_active() {
   local target=$1 swaps_file=${2:-/proc/swaps} entry rest
@@ -294,8 +352,7 @@ install_deps() {
     if command -v "$p" >/dev/null; then grn "✓ $p";
     else red "✗ $p 不可用"; missing=yes; fi
   done
-  if { [[ $OS_FAMILY == el9 ]] && rpm -q ca-certificates >/dev/null 2>&1; } || \
-      { [[ $OS_FAMILY == debian ]] && dpkg -s ca-certificates 2>/dev/null | grep -q '^Status: install ok installed'; }; then
+  if has_ca_certificates; then
     grn "✓ ca-certificates"
   else
     red "✗ ca-certificates 未安装"; missing=yes
@@ -450,9 +507,7 @@ cmd_init() {
   preflight
   ylw '初始化将按需准备系统依赖、Docker / Compose；低内存机器可选择创建 Swap。'
   confirm '确认初始化环境？' n || return 0
-  prepare_low_memory || return 1
-  install_deps || return 1
-  install_docker || return 1
+  prepare_environment || return 1
   grn '环境已就绪，请使用新增节点配置入口与出口。'
 }
 
@@ -1051,10 +1106,15 @@ node_recover() {
 cmd_node_add() {
   local edit=${1:-no} d front out p ws u image mode link rd rp ru rw oldimage='' backup existed=no label advanced=no previousimage='' rh rs
   preflight
-  command -v docker >/dev/null || { red '请先运行初始化环境，准备 Docker Engine 和 Docker Compose。'; return 1; }
-  need_docker
-  local tool
-  for tool in python3 curl openssl ss; do command -v "$tool" >/dev/null || { red "缺少 ${tool}，请先运行初始化环境再新增节点。"; return 1; }; done
+  if [[ $edit == no ]]; then
+    ensure_node_environment || return 1
+  else
+    need_docker
+    local tool
+    for tool in python3 curl openssl ss; do
+      command -v "$tool" >/dev/null || { red "缺少 ${tool}，请先运行初始化环境。"; return 1; }
+    done
+  fi
   if [[ $edit == yes ]]; then
     existed=yes; previousimage=$(node_get image) || return 1
     out=$(node_get outbound) || return 1
