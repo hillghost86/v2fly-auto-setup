@@ -1600,7 +1600,17 @@ cmd_node_add() {
   local tool
   for tool in python3 curl openssl ss; do command -v "$tool" >/dev/null || { red "缺少 ${tool}，请先手动安装再新增节点。"; return 1; }; done
   command -v python3 >/dev/null || { red '请手动安装 python3 后再管理多节点。'; return 1; }
-  if [[ $edit == yes ]]; then existed=yes; previousimage=$(node_get image) || return 1; else NODE_ID=''; fi
+  if [[ $edit == yes ]]; then
+    existed=yes; previousimage=$(node_get image) || return 1
+    out=$(node_get outbound) || return 1
+  else NODE_ID=''; out=direct; fi
+  printf '%s\n' '1) 本机节点（本机直出）' '2) 中转节点（通过远端节点出网）' '0) 返回'
+  mode=$(node_choice '节点类型' "$(if [[ $out == relay ]]; then echo 2; else echo 1; fi)" '012')
+  case $mode in
+    1) out=direct ;;
+    2) out=relay ;;
+    0) return 0 ;;
+  esac
   while true; do
     label=$(node_ask '节点名称，例如 韩国直出 / 韩国转日本（0 返回）' "$(if [[ $edit == yes ]]; then node_get label 2>/dev/null || node_get id; fi)") || return 0
     [[ $label != 0 ]] || return 0
@@ -1624,13 +1634,8 @@ fi)")
   ws=$(node_option 'WebSocket 路径' "$(if [[ $edit == yes ]]; then node_get path; else printf '/%s' "$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"; fi)")
   u=$(node_option 'UUID' "$(if [[ $edit == yes ]]; then node_get uuid; else python3 -c 'import uuid;print(uuid.uuid4())'; fi)")
   image=$(node_option 'V2Fly 镜像标签' "$(if [[ $edit == yes ]]; then node_get image | sed 's|v2fly/v2fly-core:||'; else echo latest; fi)"); [[ $image == sha256:* ]] || image="v2fly/v2fly-core:$image"
-  printf '%s\n' '1) 本机直出' '2) 远端 VMess + WS + TLS 中转（失败不直出）' '0) 返回'
-  mode=$(node_choice '出口选择' "$(if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo 2; else echo 1; fi)" '012'); out=direct
   local remote_args=()
-  case $mode in
-    1) ;;
-    2)
-      out=relay
+  if [[ $out == relay ]]; then
       printf '%s\n' '1) 导入 vmess:// 链接' '2) 手动填写'
       local remote_choices=012
       if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo '3) 保留现有远端'; remote_choices=0123; fi
@@ -1644,10 +1649,8 @@ fi)")
         remote_args=(manual "$rd" "$rp" "$ru" "$rw" "$rh" "$rs")
       elif [[ $mode == 3 && $edit == yes && $(node_get outbound) == relay ]]; then
         remote_args=(preserve)
-      else return 1; fi ;;
-    0) return 0 ;;
-    *) return 1 ;;
-  esac
+      else return 1; fi
+  fi
   echo "节点 ${label} (${NODE_ID:-自动编号})；入口 ${d}${ws} (${front})；本地端口 ${p}；出口 ${out}"
   [[ $front != nginx ]] || ylw '创建后仍需手动添加 Nginx 路径配置。'
   confirm '确认应用此节点？' n || return 0
@@ -1694,22 +1697,34 @@ cmd_node_manage() {
     3) node_test ;;
     4) docker logs --tail 100 "v2ray-node-$NODE_ID" ;;
     5) node_compose restart v2ray ;;
-    6)
-      confirm "删除节点 ${NODE_ID}？" n || return 0
-      local backup oldimage
-      backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX")
-      cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
-      oldimage=$(docker inspect -f '{{.Image}}' "v2ray-node-$NODE_ID" 2>/dev/null || true)
-      node_snapshot "$backup" "$oldimage" yes || return 1
-      if ! node_compose down; then node_recover "$backup" "$oldimage" yes; return 1; fi
-      # 元数据暂移出列表，Compose 和原镜像 ID 留在受保护的备份中供恢复。
-      mv "$STACK_DIR/nodes/$NODE_ID/metadata.json" "$backup/removed-metadata.json" || { node_recover "$backup" "$oldimage" yes; return 1; }
-      if ! node_ingress_apply; then node_recover "$backup" "$oldimage" yes; return 1; fi
-      NODE_TX_ACTIVE=no
-      rm -rf "$STACK_DIR/nodes/$NODE_ID" "$backup"
-      ylw '节点已删除；已有 Nginx 的对应 location 需要手动移除。' ;;
+    6) node_delete_selected ;;
     7) cmd_node_update ;;
   esac
+}
+
+node_delete_selected() {
+  ylw '只删除所选节点的容器与配置。'
+  ylw '保留其他节点、Docker、系统依赖和证书卷。'
+  ylw '最后一个独立 Caddy 节点删除时会停止共享入口。'
+  confirm "删除节点 ${NODE_ID}？" n || return 0
+  local backup oldimage
+  backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX")
+  cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
+  oldimage=$(docker inspect -f '{{.Image}}' "v2ray-node-$NODE_ID" 2>/dev/null || true)
+  node_snapshot "$backup" "$oldimage" yes || return 1
+  if ! node_compose down; then node_recover "$backup" "$oldimage" yes; return 1; fi
+  # 元数据暂移出列表，Compose 和原镜像 ID 留在受保护的备份中供恢复。
+  mv "$STACK_DIR/nodes/$NODE_ID/metadata.json" "$backup/removed-metadata.json" || { node_recover "$backup" "$oldimage" yes; return 1; }
+  if ! node_ingress_apply; then node_recover "$backup" "$oldimage" yes; return 1; fi
+  NODE_TX_ACTIVE=no
+  rm -rf "$STACK_DIR/nodes/$NODE_ID" "$backup"
+  ylw '节点已删除；已有 Nginx 的对应 location 需要手动移除。'
+}
+
+cmd_node_delete() {
+  need_docker
+  node_select || return 0
+  node_delete_selected
 }
 
 cmd_node_update() {
@@ -1740,10 +1755,11 @@ cmd_nodes_status() {
 node_menu() {
   echo '======== V2Fly 多节点管理 ========'
   node_python list || return 1
-  printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 卸载（逐个选择节点删除）' '6) 旧单节点菜单' '0) 退出'
+  printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 删除节点' '6) 旧单节点菜单' '0) 退出'
   case "$(node_choice '请选择' '0' '0123456')" in
     1) cmd_node_add ;;
-    2|5) cmd_node_manage ;;
+    2) cmd_node_manage ;;
+    5) cmd_node_delete ;;
     3) cmd_nodes_status ;;
     4) node_select && cmd_node_update ;;
     6) menu ;;
