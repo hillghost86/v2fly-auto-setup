@@ -67,6 +67,7 @@ RECOVERY_DIR=""
 RECOVERY_ACTIVE=no
 RECOVERY_UP=no
 RECOVERY_V2="" RECOVERY_CADDY=""
+NODE_TX_ACTIVE=no NODE_TX_BACKUP="" NODE_TX_ID="" NODE_TX_IMAGE="" NODE_TX_EXISTED=no
 SWAP_SOURCE="" SWAP_TARGET="" SWAP_CREATED_ID="" SWAP_ACTIVE=no SWAP_PERSISTED=no
 SWAP_STATUS_FILE=/proc/swaps
 SWAP_FSTAB_CANDIDATE="" SWAP_FSTAB_BACKUP=""
@@ -76,6 +77,10 @@ cleanup() {
   # 若保留 set -e，后面「恢复 Caddy」就被跳过了，服务会一直停着
   set +e
   cleanup_swap
+  if [[ $NODE_TX_ACTIVE == yes ]]; then
+    NODE_ID=$NODE_TX_ID
+    node_recover "$NODE_TX_BACKUP" "$NODE_TX_IMAGE" "$NODE_TX_EXISTED" || red "节点恢复失败，备份：$NODE_TX_BACKUP"
+  fi
   [[ -n $CHECK_PID ]] && kill "$CHECK_PID" 2>/dev/null
   if [[ $RECOVERY_ACTIVE == yes ]]; then
     recover_stack || red "恢复失败，备份保留在 $RECOVERY_DIR"
@@ -834,7 +839,7 @@ EOF
   E2E_CID_FILES+=("$E2E_CID_FILE")
   docker run -d --cidfile "$E2E_CID_FILE" --user 0:0 "${run_opts[@]}" -p 127.0.0.1::10808 \
     -v "$dir/config.json:/etc/v2ray/config.json:ro,Z" \
-    "v2fly/v2fly-core:$V2FLY_TAG" run -c /etc/v2ray/config.json >/dev/null 2>&1 || return 1
+    "${E2E_IMAGE:-v2fly/v2fly-core:$V2FLY_TAG}" run -c /etc/v2ray/config.json >/dev/null 2>&1 || return 1
   sleep 3
   hostport=$(docker port "$(cat "$E2E_CID_FILE")" 10808/tcp 2>/dev/null | head -1 | sed 's/.*://')
   if [[ -n $hostport ]]; then
@@ -1036,6 +1041,7 @@ EOF
 }
 
 cmd_install() {
+  node_legacy_guard install || return 1
   preflight
   ylw "开始前请确认：Lightsail 防火墙已放行 TCP 80 和 443；域名 A 记录已指向本机静态 IP"
   load_env
@@ -1112,6 +1118,7 @@ pull_images() {
 }
 
 cmd_update() {
+  node_legacy_guard update || return 1
   preflight; need_docker
   [[ -f $COMPOSE_FILE ]] || die "还没有安装，请先运行「安装」"
   load_env
@@ -1160,6 +1167,7 @@ cmd_status() {
 }
 
 cmd_uninstall() {
+  node_legacy_guard uninstall || return 1
   preflight; need_docker
   [[ -f $COMPOSE_FILE ]] || die "没有找到安装"
   confirm "确认卸载 v2ray 和 caddy 容器？" n || exit 0
@@ -1171,6 +1179,511 @@ cmd_uninstall() {
     rm -rf "$STACK_DIR"
   fi
   grn "已卸载。Docker 本身保留。"
+}
+
+# ---------------------------------------------------------------------------
+# 多节点：每个节点独立项目；元数据只按 JSON 解析，不执行配置中的代码。
+# ---------------------------------------------------------------------------
+node_python() {
+  command -v python3 >/dev/null || { red '多节点管理需要 python3，请先手动安装。'; return 1; }
+  python3 - "$STACK_DIR" "$@" <<'PY'
+import sys,os,json,re,uuid,base64,pathlib
+root=pathlib.Path(sys.argv[1]); action=sys.argv[2]; args=sys.argv[3:]
+nodes=root/'nodes'
+def fail(s): raise ValueError(s)
+def domain(s):
+ if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?',s) or '.' not in s or '..' in s: fail('域名格式不正确')
+ return s.lower()
+def path(s):
+ if not re.fullmatch(r'/[A-Za-z0-9._~-]+',s): fail('路径只能包含字母、数字和 . _ ~ -')
+ return s
+def ident(s):
+ if not re.fullmatch(r'[a-z][a-z0-9-]{0,31}',s): fail('节点标识须为小写字母开头，最多 32 个字母、数字或横线')
+ return s
+def port(s):
+ n=int(s)
+ if not 1024<=n<=65535: fail('本地端口必须在 1024–65535 之间')
+ return n
+def write(p,data):
+ p.parent.mkdir(parents=True,exist_ok=True); os.chmod(p.parent,0o700)
+ with open(p,'w') as f:f.write(data)
+ os.chmod(p,0o600)
+def allnodes():
+ return [json.loads(p.read_text()) for p in sorted(nodes.glob('*/metadata.json'))]
+def legacy():
+ env={}
+ p=root/'.env'
+ if p.exists():
+  for line in p.read_text().splitlines():
+   if '=' in line and not line.lstrip().startswith('#'):
+    k,v=line.split('=',1);env[k]=v.strip().strip('"\'')
+ return env
+def remote(address,p,u,ws,host='',sni=''):
+ p=int(p)
+ if not 1<=p<=65535:fail('远端端口不正确')
+ return dict(domain=domain(address),port=p,uuid=str(uuid.UUID(u)),path=path(ws),host=domain(host or address),sni=domain(sni or address))
+def readnode(s):
+ ident(s);return json.loads((nodes/s/'metadata.json').read_text())
+def render(n):
+ outbound={'protocol':'freedom','settings':{}}
+ if n['outbound']=='relay':
+  r=n['remote'];outbound={'tag':'relay','protocol':'vmess','settings':{'vnext':[{'address':r['domain'],'port':r['port'],'users':[{'id':r['uuid'],'alterId':0,'security':'auto'}]}]},'streamSettings':{'network':'ws','security':'tls','tlsSettings':{'serverName':r['sni'],'allowInsecure':False},'wsSettings':{'path':r['path'],'headers':{'Host':r['host']}}}}
+ config={'log':{'loglevel':'warning'},'inbounds':[{'listen':'0.0.0.0','port':2333,'protocol':'vmess','settings':{'clients':[{'id':n['uuid'],'alterId':0}]},'streamSettings':{'network':'ws','wsSettings':{'path':n['path']}}}],'outbounds':[outbound]}
+ folder=nodes/n['id'];write(folder/'config.json',json.dumps(config,ensure_ascii=False,indent=2)+'\n')
+ # inline content 沿用现有 Compose 的 SELinux 隔离；域名等经过白名单校验。
+ text='name: v2ray-node-'+n['id']+'\nservices:\n  v2ray:\n    image: '+json.dumps(n['image'])+'\n    container_name: v2ray-node-'+n['id']+'\n    restart: unless-stopped\n    command: run -c /etc/v2ray/config.json\n    ports:\n      - "127.0.0.1:'+str(n['port'])+':2333"\n    configs:\n      - source: node_config\n        target: /etc/v2ray/config.json\nconfigs:\n  node_config:\n    content: |\n'+''.join('      '+line+'\n' for line in json.dumps(config,ensure_ascii=False,indent=2).splitlines())
+ write(folder/'compose.yaml',text)
+def ingress():
+ env=legacy(); ns=allnodes(); caddy=[n for n in ns if n['front']=='caddy']; haslegacy=env.get('DOMAIN') and env.get('FRONT','caddy')!='nginx'
+ if not caddy and not haslegacy:return
+ domains={}
+ if haslegacy:
+  domains.setdefault(domain(env['DOMAIN']),[]).append((path(env['WS_PATH']),'v2ray:2333'))
+ for n in caddy:domains.setdefault(n['domain'],[]).append((n['path'],'v2ray-node-'+n['id']+':2333'))
+ text=''
+ for d,routes in sorted(domains.items()):
+  text+=d+' {\n'
+  for p,up in routes:text+='  handle '+p+' {\n    reverse_proxy '+up+'\n  }\n'
+  text+='  handle {\n    respond "It works!" 200\n  }\n}\n'
+ write(root/'ingress'/'Caddyfile',text)
+ # 网络由 Caddy 项目创建，各个节点连接同一个网络；只有 Caddy 入口共享。
+ if haslegacy:
+  text='services:\n  caddy:\n    command: caddy run --config /managed/Caddyfile --adapter caddyfile\n    volumes:\n      - ./ingress:/managed:ro,Z\n'
+ else:
+  tag=env.get('CADDY_TAG','2')
+  if not re.fullmatch(r'[A-Za-z0-9_.-]+',tag):fail('Caddy 镜像标签不正确')
+  text='name: v2ray-ingress\nservices:\n  caddy:\n    image: caddy:'+tag+'\n    container_name: v2ray-ingress\n    restart: unless-stopped\n    command: caddy run --config /managed/Caddyfile --adapter caddyfile\n    ports:\n      - "80:80"\n      - "443:443"\n    volumes:\n      - ./ingress:/managed:ro,Z\n      - node_caddy_data:/data\n      - node_caddy_config:/config\nvolumes:\n  node_caddy_data:\n  node_caddy_config:\n'
+ write(root/'ingress.yaml',text)
+try:
+ if action=='create':
+  s,d,front,out,p,ws,u,image=args[:8];ident(s);d=domain(d);path(ws);port(p);uuid.UUID(u)
+  if front not in ('nginx','caddy') or out not in ('direct','relay'):fail('入口或出口方式不正确')
+  if not re.fullmatch(r'(?:v2fly/v2fly-core:[A-Za-z0-9_.-]+|sha256:[a-f0-9]{64})',image):fail('镜像标签不正确')
+  ns=allnodes();env=legacy()
+  for n in ns:
+   if n['id']!=s and (n['port']==int(p) or (n['domain']==d and n['path']==ws)):fail('端口或入口路径已被其他节点使用')
+   if n['domain']==d and n['front']!=front:fail('同一域名不能同时使用 Caddy 和 Nginx')
+  if env.get('DOMAIN'):
+   if int(p)==2333 or (d==env['DOMAIN'] and ws==env.get('WS_PATH')):fail('端口或路径与旧节点冲突')
+   if (env.get('FRONT','caddy')=='nginx') != (front=='nginx'):fail('已有入口占用 80/443，新增节点须沿用相同的 HTTPS 管理方式')
+  if ns and any(n['front']!=front for n in ns):fail('Caddy 与 Nginx 会争用 80/443，须使用同一种入口管理方式')
+  n=dict(id=s,domain=d,front=front,outbound=out,port=int(p),path=ws,uuid=str(uuid.UUID(u)),image=image)
+  if out=='relay':
+   if args[8]=='link':
+    link=args[9]
+    if not link.startswith('vmess://'):fail('仅支持 vmess:// 链接')
+    raw=link[8:];v=json.loads(base64.b64decode(raw+'='*((-len(raw))%4),validate=True))
+    if any(v.get(k) not in (None,'',False,'false','0',0) for k in ('allowInsecure','alpn','fp','packetEncoding')):fail('链接包含暂不支持的 TLS 或传输选项')
+    if v.get('net')!='ws' or v.get('tls')!='tls' or str(v.get('aid','0'))!='0' or v.get('scy','auto') not in ('auto','aes-128-gcm','chacha20-poly1305') or v.get('type','none') not in ('none',''):fail('仅支持 alterId=0 的 VMess + WS + TLS 链接')
+    n['remote']=remote(v['add'],v['port'],v['id'],v['path'],v.get('host'),v.get('sni'))
+   elif args[8]=='preserve':n['remote']=readnode(s)['remote']
+   else:n['remote']=remote(*args[9:15])
+  write(nodes/s/'metadata.json',json.dumps(n,ensure_ascii=False,indent=2)+'\n');render(n)
+ elif action=='get':
+  n=readnode(args[0]);v=n[args[1]];print(v if not isinstance(v,(dict,list)) else json.dumps(v))
+ elif action=='list':
+  env=legacy()
+  if env.get('DOMAIN'):print('旧节点\t'+env['DOMAIN']+' '+env.get('WS_PATH','')+'\t保留原配置，使用旧菜单管理')
+  for n in allnodes():print(n['id']+' ('+n.get('label',n['id'])+')\t'+n['domain']+' '+n['path']+'\t'+('本机直出' if n['outbound']=='direct' else '中转 '+n['remote']['domain'])+'\t'+n['front'])
+ elif action=='ids':
+  for n in allnodes():print(n['id'])
+ elif action=='ingress':ingress()
+ elif action=='link':
+  n=readnode(args[0]);v=dict(v='2',ps=n.get('label',n['id']),add=n['domain'],port='443',id=n['uuid'],aid='0',scy='auto',net='ws',type='none',host=n['domain'],path=n['path'],tls='tls',sni=n['domain']);print('vmess://'+base64.b64encode(json.dumps(v).encode()).decode())
+ elif action=='label':
+  n=readnode(args[0]);label=args[1]
+  if not label or len(label)>80 or any(ord(c)<32 for c in label):fail('节点名称须为 1–80 个可见字符')
+  n['label']=label;write(nodes/n['id']/'metadata.json',json.dumps(n,ensure_ascii=False,indent=2)+'\n')
+ elif action=='image':
+  n=readnode(args[0]);n['image']=args[1];write(nodes/n['id']/'metadata.json',json.dumps(n,indent=2));render(n)
+ else:fail('未知元数据操作')
+except (ValueError,KeyError,OSError,TypeError,IndexError) as e:
+ print('节点配置错误：'+str(e),file=sys.stderr);sys.exit(1)
+PY
+}
+
+node_compose() { docker compose --project-directory "$STACK_DIR/nodes/$NODE_ID" "$@"; }
+node_get() { node_python get "$NODE_ID" "$1"; }
+node_legacy_guard() {
+  if [[ -f $STACK_DIR/ingress.yaml ]] || { [[ -d $STACK_DIR/nodes ]] && [[ -n $(node_python ids) ]]; }; then
+    red '存在独立节点。旧安装/更新/卸载会影响共享入口，请使用节点管理；旧配置已保留。'
+    return 1
+  fi
+  return 0
+}
+
+node_ingress_apply() {
+  local force=${1:-no} legacy=no name network project ids previous='' changed=yes caddy_image checkdir
+  ids=$(node_python ids) || return 1
+  if [[ -z $ids && ! -f $COMPOSE_FILE && -f $STACK_DIR/ingress.yaml ]]; then
+    project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' v2ray-ingress 2>/dev/null || true)
+    [[ -z $project || $project == v2ray-ingress ]] || return 1
+    docker compose --project-directory "$STACK_DIR" -f "$STACK_DIR/ingress.yaml" down || return 1
+    rm -f "$STACK_DIR/ingress.yaml" "$STACK_DIR/ingress/Caddyfile"
+    return 0
+  fi
+  if [[ -f $COMPOSE_FILE ]]; then
+    # 仅读取旧 FRONT，禁止执行 .env 内容。
+    if ! grep -q '^FRONT=nginx$' "$ENV_FILE"; then legacy=yes; fi
+  fi
+  if [[ -f $STACK_DIR/ingress/Caddyfile ]]; then previous=$(cat "$STACK_DIR/ingress/Caddyfile"); fi
+  node_python ingress || return 1
+  if [[ -n $previous && $previous == $(cat "$STACK_DIR/ingress/Caddyfile" 2>/dev/null) ]]; then changed=no; fi
+  [[ -f $STACK_DIR/ingress.yaml ]] || return 0
+  if [[ -n ${NODE_INGRESS_IMAGE:-} && $legacy == no ]]; then
+    python3 - "$STACK_DIR/ingress.yaml" "$NODE_INGRESS_IMAGE" <<'PYIMAGE'
+import sys,re
+p=sys.argv[1];s=open(p).read();s=re.sub(r'    image: .*','    image: "'+sys.argv[2]+'"',s);open(p,'w').write(s)
+PYIMAGE
+  fi
+  if [[ $legacy == yes ]]; then
+    name=caddy;
+    project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' caddy 2>/dev/null || true)
+    [[ $project == v2ray ]] || { red '已有 caddy 容器不属于旧项目，停止修改入口'; return 1; }
+    network=v2ray_default
+    if ! docker inspect -f '{{.Config.Cmd}}' "$name" 2>/dev/null | grep -q /managed/Caddyfile; then
+      caddy_image=$(docker inspect -f '{{.Image}}' caddy) || return 1
+      mktmp checkdir || return 1
+      E2E_CID_FILES+=("$checkdir/caddy-check.cid")
+      docker run --rm --cidfile "$checkdir/caddy-check.cid" --network none -v "$STACK_DIR/ingress:/managed:ro,Z" "$caddy_image" caddy validate --config /managed/Caddyfile --adapter caddyfile || return 1
+      ylw '首次接管标准 Caddy 入口需要重建 Caddy，现有连接会短暂中断。'
+      if [[ $NODE_TX_ACTIVE == yes ]]; then touch "$NODE_TX_BACKUP/caddy.changed"; fi
+      docker compose --project-directory "$STACK_DIR" -f "$COMPOSE_FILE" -f "$STACK_DIR/ingress.yaml" up -d --no-deps --pull never caddy || return 1
+    fi
+  else
+    name=v2ray-ingress; network=v2ray-ingress_default
+    node_owner "$name" v2ray-ingress || return 1
+    if ! container_running "$name"; then
+      docker compose --project-directory "$STACK_DIR" -f "$STACK_DIR/ingress.yaml" up -d caddy || return 1
+    fi
+  fi
+  local id
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    if [[ $(node_python get "$id" front) == caddy ]]; then
+      if ! docker inspect -f '{{json .NetworkSettings.Networks}}' "v2ray-node-$id" | grep -q "\"$network\""; then
+        docker network connect "$network" "v2ray-node-$id" || return 1
+      fi
+    fi
+  done < <(node_python ids)
+  [[ $changed != no || $force == yes ]] || return 0
+  ylw '共享 Caddy 入口配置变化，现有 WebSocket 连接可能需要重连。'
+  docker exec "$name" caddy validate --config /managed/Caddyfile --adapter caddyfile || return 1
+  docker exec "$name" caddy reload --config /managed/Caddyfile --adapter caddyfile
+}
+
+node_hint() {
+  local d p port
+  d=$(node_get domain); p=$(node_get path); port=$(node_get port)
+  echo "请在 $d 的 HTTPS server 块加入以下内容并重载 Nginx："
+  cat <<EOF
+    location = $p {
+        proxy_pass http://127.0.0.1:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 300s;
+    }
+EOF
+}
+
+node_owner() {
+  local name=$1 expected=$2 project
+  if docker inspect "$name" >/dev/null 2>&1; then
+    project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$name" 2>/dev/null || true)
+    [[ $project == "$expected" ]] || { red "同名容器 $name 不属于本项目，停止操作"; return 1; }
+  fi
+}
+
+node_option() {
+  if [[ $advanced == yes ]]; then ask "$1" "$2"; else printf '%s' "$2"; fi
+}
+
+node_select() {
+  node_python list || return 1
+  NODE_ID=$(ask '节点标识（旧节点请使用旧 show/status 子命令）' '')
+  node_get id >/dev/null || return 1
+  node_owner "v2ray-node-$NODE_ID" "v2ray-node-$NODE_ID" || return 1
+}
+
+node_show() {
+  local link
+  link=$(node_python link "$NODE_ID") || return 1
+  echo "$link"
+  if command -v qrencode >/dev/null; then printf '%s' "$link" | qrencode -t ANSIUTF8; fi
+  [[ $(node_get front) != nginx ]] || node_hint
+}
+
+node_test() {
+  local DOMAIN UUID WS_PATH FRONT V2FLY_TAG code
+  DOMAIN=$(node_get domain); UUID=$(node_get uuid); WS_PATH=$(node_get path); FRONT=nginx
+  V2FLY_TAG=$(node_get image)
+  local E2E_IMAGE=$V2FLY_TAG
+  V2FLY_TAG=${V2FLY_TAG#*:}
+  if ws_ok; then grn '✓ HTTPS / WebSocket 入口正常'; else red '✗ HTTPS 入口失败，请检查证书及反向代理'; return 1; fi
+  if e2e_ok; then grn '✓ 此节点代理链路连通；请用 Shadowrocket 核对出口 IP'; else red '✗ 出口链路不通，请查看此节点日志'; return 1; fi
+}
+
+# 变更只影响选定节点；失败保留备份并使用原镜像 ID 恢复。
+node_local_ok() {
+  local code p ws
+  p=$(node_get port); ws=$(node_get path)
+  code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 2 \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "http://127.0.0.1:$p$ws" 2>/dev/null || true)
+  [[ $code == 101 ]]
+}
+
+node_ready() {
+  wait_for node_local_ok 6 || return 1
+  if [[ $(node_get front) == caddy ]]; then
+    local DOMAIN WS_PATH
+    DOMAIN=$(node_get domain); WS_PATH=$(node_get path)
+    wait_for ws_ok 36 || return 1
+    node_test || return 1
+  else
+    ylw 'V2Fly 本地入口已就绪；Nginx 反代配置完成后请在管理菜单测试连接。'
+  fi
+}
+
+node_apply() {
+  local backup=$1 oldimage=$2 existed=$3
+  if node_compose config -q && node_compose run --rm --no-deps --pull never v2ray test -c /etc/v2ray/config.json && node_compose up -d --no-deps --force-recreate --pull never v2ray; then
+    if { [[ $(node_get front) != caddy ]] || node_ingress_apply; } && node_ready; then return 0; fi
+  fi
+  red '节点变更失败，正在恢复。'
+  node_recover "$backup" "$oldimage" "$existed" || red "恢复失败，备份：$backup"
+  return 1
+}
+
+node_snapshot() {
+  local backup=$1
+  [[ ! -f $STACK_DIR/ingress.yaml ]] || cp -p "$STACK_DIR/ingress.yaml" "$backup/shared.yaml" || return 1
+  [[ ! -f $STACK_DIR/ingress/Caddyfile ]] || cp -p "$STACK_DIR/ingress/Caddyfile" "$backup/shared.Caddyfile" || return 1
+  docker inspect -f '{{.Image}}' caddy > "$backup/caddy.image" 2>/dev/null || true
+  docker inspect -f '{{.Config.Cmd}}' caddy > "$backup/caddy.command" 2>/dev/null || true
+  docker inspect -f '{{.Image}}' v2ray-ingress > "$backup/ingress.image" 2>/dev/null || true
+  chmod 600 "$backup/"* || return 1
+  NODE_TX_BACKUP=$backup NODE_TX_ID=$NODE_ID NODE_TX_IMAGE=${2:-} NODE_TX_EXISTED=${3:-no} NODE_TX_ACTIVE=yes
+}
+
+node_restore_files() {
+  local backup=$1 file
+  for file in metadata.json config.json compose.yaml; do
+    [[ ! -f $backup/$file ]] || cp -p "$backup/$file" "$STACK_DIR/nodes/$NODE_ID/$file" || return 1
+  done
+}
+
+node_recover() {
+  local backup=$1 oldimage=$2 existed=$3
+  NODE_TX_ACTIVE=no
+  if [[ $existed == yes ]]; then
+    mkdir -p "$STACK_DIR/nodes/$NODE_ID"
+    node_restore_files "$backup" || return 1
+    [[ -n $oldimage ]] || { red "找不到旧镜像 ID，备份：$backup"; return 1; }
+    node_python image "$NODE_ID" "$oldimage" || return 1
+    node_compose up -d --no-deps --force-recreate --pull never v2ray || return 1
+  else
+    if [[ -f $STACK_DIR/nodes/$NODE_ID/compose.yaml ]]; then node_compose down || return 1; fi
+    rm -rf "$STACK_DIR/nodes/$NODE_ID"
+  fi
+  # 首次接管旧 Caddy 失败：原 compose 未变，使用原镜像 ID 恢复命令和挂载。
+  if [[ -f $backup/caddy.changed && -s $backup/caddy.image ]] && ! grep -q /managed/Caddyfile "$backup/caddy.command"; then
+    printf 'services:\n  caddy:\n    image: "%s"\n' "$(cat "$backup/caddy.image")" > "$backup/caddy-rollback.yaml"
+    chmod 600 "$backup/caddy-rollback.yaml"
+    docker compose --project-directory "$STACK_DIR" -f "$COMPOSE_FILE" -f "$backup/caddy-rollback.yaml" up -d --no-deps --force-recreate --pull never caddy || return 1
+  elif [[ ! -s $backup/ingress.image && ! -s $backup/caddy.image && -f $STACK_DIR/ingress.yaml ]]; then
+    docker compose --project-directory "$STACK_DIR" -f "$STACK_DIR/ingress.yaml" down || return 1
+  fi
+  if [[ -f $backup/shared.yaml ]]; then cp -p "$backup/shared.yaml" "$STACK_DIR/ingress.yaml"; else rm -f "$STACK_DIR/ingress.yaml"; fi
+  if [[ -f $backup/shared.Caddyfile ]]; then
+    mkdir -p "$STACK_DIR/ingress"; cp -p "$backup/shared.Caddyfile" "$STACK_DIR/ingress/Caddyfile"
+    local NODE_INGRESS_IMAGE=''
+    [[ ! -s $backup/ingress.image ]] || NODE_INGRESS_IMAGE=$(cat "$backup/ingress.image")
+    node_ingress_apply yes || return 1
+  else rm -f "$STACK_DIR/ingress/Caddyfile"; fi
+  ylw "已恢复；变更备份保留在 $backup"
+}
+
+cmd_node_add() {
+  local edit=${1:-no} d front out p ws u image mode link rd rp ru rw oldimage='' backup existed=no label advanced=no previousimage='' rh rs
+  preflight
+  command -v docker >/dev/null || { red '新增节点需要先手动准备 Docker Engine 和 Docker Compose。'; return 1; }
+  need_docker
+  local tool
+  for tool in python3 curl openssl ss; do command -v "$tool" >/dev/null || { red "缺少 ${tool}，请先手动安装再新增节点。"; return 1; }; done
+  command -v python3 >/dev/null || { red '请手动安装 python3 后再管理多节点。'; return 1; }
+  if [[ $edit == no ]]; then
+    NODE_ID=$(ask '节点标识，例如 kr-direct 或 kr-jp' '')
+    [[ $NODE_ID =~ ^[a-z][a-z0-9-]{0,31}$ ]] || { red '节点标识格式不正确'; return 1; }
+    [[ ! -e $STACK_DIR/nodes/$NODE_ID ]] || { red '节点已存在，请使用管理节点'; return 1; }
+  else existed=yes; previousimage=$(node_get image) || return 1; fi
+  label=$(ask '节点名称，例如 韩国直出 / 韩国转日本' "$(if [[ $edit == yes ]]; then node_get label 2>/dev/null || node_get id; else echo "$NODE_ID"; fi)")
+  node_python list
+  echo '入口：1) 复用已有域名  2) Caddy 新域名  3) 已有 Nginx 新域名'
+  mode=$(ask '入口选择' '1')
+  d=$(ask '入口域名' "$( [[ $edit == yes ]] && node_get domain || true )")
+  d=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')
+  case $mode in
+    1)
+      front=$(python3 - "$STACK_DIR" "$d" <<'PY'
+import sys,pathlib,json
+r=pathlib.Path(sys.argv[1]);d=sys.argv[2];found=''
+for p in (r/'nodes').glob('*/metadata.json'):
+ n=json.loads(p.read_text())
+ if n['domain']==d:found=n['front']
+e={}
+if (r/'.env').exists():
+ for l in (r/'.env').read_text().splitlines():
+  if '=' in l:k,v=l.split('=',1);e[k]=v
+ if e.get('DOMAIN')==d:found=e.get('FRONT','caddy')
+print(found)
+PY
+)
+      [[ -n $front ]] || { red '没有找到可复用的域名，请选择新域名入口'; return 1; } ;;
+    2) front=caddy ;;
+    3) front=nginx ;;
+    *) return 1 ;;
+  esac
+  if [[ $front == caddy ]] && ! container_running caddy && ! container_running v2ray-ingress; then
+    if port_in_use 80 || port_in_use 443; then red '80/443 已被占用，请选择已有 Nginx'; return 1; fi
+  fi
+  if confirm '是否修改高级设置（端口、UUID、路径、镜像）？' n; then advanced=yes; fi
+  p=$(node_option '本地端口' "$(if [[ $edit == yes ]]; then node_get port; else python3 - "$STACK_DIR" <<'PY'
+import sys,json,pathlib,socket
+used={2333}
+for p in (pathlib.Path(sys.argv[1])/'nodes').glob('*/metadata.json'):used.add(json.loads(p.read_text())['port'])
+for port in range(2334,65536):
+ if port in used:continue
+ s=socket.socket()
+ try:s.bind(('127.0.0.1',port));print(port);break
+ except OSError:pass
+ finally:s.close()
+PY
+fi)")
+  if [[ $edit != yes || $p != $(node_get port) ]] && port_in_use "$p"; then red '本地端口已被占用'; return 1; fi
+  ws=$(node_option 'WebSocket 路径' "$(if [[ $edit == yes ]]; then node_get path; else printf '/%s' "$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"; fi)")
+  u=$(node_option 'UUID' "$(if [[ $edit == yes ]]; then node_get uuid; else python3 -c 'import uuid;print(uuid.uuid4())'; fi)")
+  image=$(node_option 'V2Fly 镜像标签' "$(if [[ $edit == yes ]]; then node_get image | sed 's|v2fly/v2fly-core:||'; else echo latest; fi)"); [[ $image == sha256:* ]] || image="v2fly/v2fly-core:$image"
+  echo '出口：1) 本机直出  2) 远端 VMess + WS + TLS 中转（失败不直出）'
+  mode=$(ask '出口选择' "$(if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo 2; else echo 1; fi)"); out=direct
+  local remote_args=()
+  case $mode in
+    1) ;;
+    2)
+      out=relay; mode=$(ask '远端配置：1) 导入 vmess:// 链接  2) 手动填写  3) 保留现有远端（修改时）' "$(if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo 3; else echo 1; fi)")
+      if [[ $mode == 1 ]]; then link=$(ask '日本节点 vmess:// 链接' ''); remote_args=(link "$link")
+      elif [[ $mode == 2 ]]; then
+        rd=$(ask '远端域名' ''); rp=$(ask '远端端口' '443'); ru=$(ask '远端 UUID' ''); rw=$(ask '远端 WS 路径' '')
+        rh=$(ask '远端 WebSocket Host' "$rd"); rs=$(ask '远端 TLS SNI' "$rd")
+        remote_args=(manual "$rd" "$rp" "$ru" "$rw" "$rh" "$rs")
+      elif [[ $mode == 3 && $edit == yes && $(node_get outbound) == relay ]]; then
+        remote_args=(preserve)
+      else return 1; fi ;;
+    *) return 1 ;;
+  esac
+  echo "节点 ${NODE_ID}；入口 ${d}${ws} (${front})；本地端口 ${p}；出口 ${out}"
+  [[ $front != nginx ]] || ylw '创建后仍需手动添加 Nginx 路径配置。'
+  confirm '确认应用此节点？' n || return 0
+  mkdir -p "$STACK_DIR/nodes"; chmod 700 "$STACK_DIR/nodes"
+  node_owner "v2ray-node-$NODE_ID" "v2ray-node-$NODE_ID" || return 1
+  backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX"); chmod 700 "$backup"
+  if [[ $existed == yes ]]; then
+    cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
+    oldimage=$(docker inspect -f '{{.Image}}' "v2ray-node-$NODE_ID" 2>/dev/null || true)
+  fi
+  node_snapshot "$backup" "$oldimage" "$existed" || return 1
+  if [[ $existed == yes && $image == "$previousimage" ]]; then
+    [[ -n $oldimage ]] || { NODE_TX_ACTIVE=no; red "无法读取旧镜像 ID，停止修改；备份：$backup"; return 1; }
+    image=$oldimage
+  fi
+  if ! node_python create "$NODE_ID" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" "${remote_args[@]}"; then
+    if [[ $existed == yes ]]; then
+      node_restore_files "$backup" || return 1
+    else rm -rf "$STACK_DIR/nodes/$NODE_ID"; fi
+    NODE_TX_ACTIVE=no
+    return 1
+  fi
+  # 下载镜像为明确的创建节点操作所需，不涉及主机依赖安装。
+  if [[ $image != sha256:* ]] && ! node_compose pull -q v2ray; then
+    NODE_TX_ACTIVE=no
+    if [[ $existed == yes ]]; then node_restore_files "$backup"; else rm -rf "$STACK_DIR/nodes/$NODE_ID"; fi
+    red "拉取失败，旧节点未改变；备份：$backup"; return 1
+  fi
+  if ! node_python label "$NODE_ID" "$label"; then node_recover "$backup" "$oldimage" "$existed"; return 1; fi
+  if ! node_apply "$backup" "$oldimage" "$existed"; then return 1; fi
+  NODE_TX_ACTIVE=no
+  rm -rf "$backup"
+  node_show
+  grn '节点配置已应用。分别导入各节点链接，在客户端切换。'
+}
+
+cmd_node_manage() {
+  need_docker; node_select || return 1
+  echo '1) 链接/二维码  2) 修改  3) 测试连接  4) 日志  5) 重启  6) 删除  7) 更新镜像'
+  case "$(ask '操作' '1')" in
+    1) node_show ;;
+    2) cmd_node_add yes ;;
+    3) node_test ;;
+    4) docker logs --tail 100 "v2ray-node-$NODE_ID" ;;
+    5) node_compose restart v2ray ;;
+    6)
+      confirm "删除节点 ${NODE_ID}？" n || return 0
+      local backup oldimage
+      backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX")
+      cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
+      oldimage=$(docker inspect -f '{{.Image}}' "v2ray-node-$NODE_ID" 2>/dev/null || true)
+      node_snapshot "$backup" "$oldimage" yes || return 1
+      if ! node_compose down; then node_recover "$backup" "$oldimage" yes; return 1; fi
+      # 元数据暂移出列表，Compose 和原镜像 ID 留在受保护的备份中供恢复。
+      mv "$STACK_DIR/nodes/$NODE_ID/metadata.json" "$backup/removed-metadata.json" || { node_recover "$backup" "$oldimage" yes; return 1; }
+      if ! node_ingress_apply; then node_recover "$backup" "$oldimage" yes; return 1; fi
+      NODE_TX_ACTIVE=no
+      rm -rf "$STACK_DIR/nodes/$NODE_ID" "$backup"
+      ylw '节点已删除；已有 Nginx 的对应 location 需要手动移除。' ;;
+    7) cmd_node_update ;;
+  esac
+}
+
+cmd_node_update() {
+  local backup oldimage image
+  image=$(ask '新镜像标签' 'latest')
+  [[ $image =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX")
+  cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
+  oldimage=$(docker inspect -f '{{.Image}}' "v2ray-node-$NODE_ID" 2>/dev/null || true)
+  node_snapshot "$backup" "$oldimage" yes || return 1
+  node_python image "$NODE_ID" "v2fly/v2fly-core:$image" || return 1
+  if ! node_compose pull -q v2ray; then NODE_TX_ACTIVE=no; node_restore_files "$backup"; red "拉取失败；备份：$backup"; return 1; fi
+  node_apply "$backup" "$oldimage" yes || return 1
+  NODE_TX_ACTIVE=no
+  rm -rf "$backup"
+}
+
+cmd_nodes_status() {
+  need_docker; node_python list || return 1
+  local id
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    NODE_ID=$id; node_compose ps
+  done < <(node_python ids)
+  [[ ! -f $COMPOSE_FILE ]] || compose ps
+}
+
+node_menu() {
+  echo '======== V2Fly 多节点管理 ========'
+  node_python list || return 1
+  echo '1) 新增节点  2) 管理节点  3) 所有节点状态  4) 更新指定节点  5) 卸载（逐个选择节点删除）'
+  echo '6) 旧单节点菜单  0) 退出'
+  case "$(ask '请选择' '')" in
+    1) cmd_node_add ;;
+    2|5) cmd_node_manage ;;
+    3) cmd_nodes_status ;;
+    4) node_select && cmd_node_update ;;
+    6) menu ;;
+  esac
 }
 
 menu() {
@@ -1209,7 +1722,10 @@ main() {
     status)    need_root status;    cmd_status ;;
     show)      need_root show;      cmd_show "${2:-auto}" ;;
     uninstall) need_root uninstall; cmd_uninstall ;;
-    "")        need_root;           menu ;;
+    node-add) need_root; cmd_node_add ;;
+    node-manage) need_root; cmd_node_manage ;;
+    nodes) need_root; cmd_nodes_status ;;
+    "")        need_root;           node_menu ;;
     *)         die "未知命令: $1（可用: install update status show uninstall）" ;;
   esac
 }
