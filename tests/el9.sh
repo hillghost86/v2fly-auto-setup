@@ -220,7 +220,7 @@ case "$CASE" in
     assert not_contains 'systemctl start firewalld'
     ;;
   selinux)
-    FRONT=nginx; DOMAIN=test.invalid; UUID=test-only; WS_PATH=/test; V2FLY_TAG=latest
+    FRONT=nginx; DOMAIN=test.invalid; UUID=test-only; WS_PATH=/test; E2E_IMAGE=v2fly/v2fly-core:latest
     curl(){ echo 204; }
     e2e_ok || exit 1
     assert contains '/etc/v2ray/config.json:ro,Z'
