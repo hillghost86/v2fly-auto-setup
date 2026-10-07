@@ -115,11 +115,21 @@ echo 'PASS guarded-legacy-overwrite'
   confirm(){ [[ $1 != *'高级设置'* ]]; }
   node_apply(){ echo "$NODE_ID" >> "$ROOT/applied"; }
   node_show(){ :; }
-  cmd_node_add yes
+  cmd_node_add yes > "$ROOT/edit-defaults.log"
+  [[ $(rg -c '^1\) 本机节点' "$ROOT/edit-defaults.log") == 1 ]]
   [[ $(node_get outbound) == relay ]] || exit 1
   [[ $(node_get image) == sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] || exit 1
   [[ $(node_get path) == /jp ]] || exit 1
   [[ $(cat "$ROOT/applied") == jp ]] || exit 1
+  # 主动改成本机直出不保留远端元数据；类型整流程只询问一次。
+  node_ask(){
+    printf '%s\n' "$1" >> "$ROOT/edit-switch-prompts"
+    if [[ $1 == 节点类型 ]]; then printf 1; else printf '%s' "$2"; fi
+  }
+  cmd_node_add yes > "$ROOT/edit-switch.log"
+  [[ $(node_get outbound) == direct ]]
+  if node_get remote >/dev/null 2>&1; then exit 1; fi
+  [[ $(rg -c '^节点类型$' "$ROOT/edit-switch-prompts") == 1 ]]
   echo 'PASS edit-interactive-defaults-preserve-relay'
 )
 # 最后独立 Caddy 节点删除：只关闭自有入口，保留证书卷。
@@ -169,14 +179,14 @@ echo 'PASS guarded-legacy-overwrite'
  docker(){ if [[ $1 == inspect ]]; then return 1; fi; }
  node_apply(){ :; }; node_show(){ :; }
  cmd_node_add > "$ROOT/fresh-menu.log" <<'INPUT'
+9
+1
 韩国直出
 99
 1
 bad domain
 fresh.example.com
 n
-9
-1
 y
 INPUT
  NODE_ID=1
@@ -186,10 +196,10 @@ INPUT
  [[ $(cat "$ROOT/fresh-menu.log") != *'节点标识'* ]]
  # 最终取消不分配序号、不增加目录。
  cmd_node_add > "$ROOT/cancel-menu.log" <<'INPUT'
+1
 取消测试
 1
 n
-1
 n
 INPUT
  [[ $(cat "$STACK_DIR/nodes/.id-sequence") == 1 && ! -e $STACK_DIR/nodes/2 ]]
@@ -230,6 +240,76 @@ INPUT
  cmd_node_add </dev/null
  [[ ! -e $STACK_DIR ]]
  echo 'PASS fresh-busy-default-and-no-write-on-return'
+)
+
+# 新建第一问类型，编辑保留原类型；返回时不创建文件。
+(
+ STACK_DIR="$ROOT/type-first"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
+ preflight(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }
+ docker(){ if [[ $1 == inspect ]]; then return 1; fi; }
+ node_apply(){ :; }; node_show(){ :; }
+ node_ask(){ printf '%s\n' "$1" >> "$ROOT/type-prompts"; ask "$@"; }
+ cmd_node_add <<<'0' > "$ROOT/type-cancel.log"
+ [[ $(cat "$ROOT/type-prompts") == 节点类型 && ! -e $STACK_DIR ]]
+ : > "$ROOT/type-prompts"
+ cmd_node_add > "$ROOT/type-relay.log" <<INPUT
+2
+中转测试
+2
+relay.example.com
+n
+2
+jp.example.com
+443
+$U
+/remote
+
+
+y
+INPUT
+ NODE_ID=1
+ [[ $(node_get outbound) == relay ]]
+ [[ $(head -n 2 "$ROOT/type-prompts" | tr '\n' '|') == '节点类型|节点名称，例如 韩国直出 / 韩国转日本（0 返回）|' ]]
+ [[ $(cat "$ROOT/type-relay.log") == *'2) 中转节点（通过远端节点出网）'* ]]
+ echo 'PASS type-first-relay-and-zero-without-mutation'
+)
+# 主菜单删除直接选择、确认；拒绝不改变文件，只操作目标容器。
+(
+ STACK_DIR="$ROOT/delete-flow"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
+ node_python create 1 one.example.com nginx direct 2334 /one "$U" v2fly/v2fly-core:latest
+ node_python create 2 two.example.com nginx direct 2335 /two "$U" v2fly/v2fly-core:latest
+ cp "$STACK_DIR/nodes/1/metadata.json" "$ROOT/before-delete"
+ need_docker(){ :; }; node_owner(){ :; }
+ docker(){ printf '%s\n' "$*" >> "$ROOT/delete-effects"; if [[ $* == *'{{.Image}}'* ]]; then echo sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; fi; }
+ node_compose(){ printf 'node=%s %s\n' "$NODE_ID" "$*" >> "$ROOT/delete-effects"; }
+ node_ingress_apply(){ printf 'ingress\n' >> "$ROOT/delete-effects"; }
+ node_ask(){ printf '%s\n' "$1" >> "$ROOT/delete-prompts"; ask "$@"; }
+ node_menu > "$ROOT/delete-refuse.log" <<'INPUT'
+5
+1
+n
+INPUT
+ cmp "$STACK_DIR/nodes/1/metadata.json" "$ROOT/before-delete"
+ [[ ! -e $ROOT/delete-effects ]]
+ [[ $(cat "$ROOT/delete-prompts" | tr '\n' '|') == '请选择|选择节点|' ]]
+ [[ $(cat "$ROOT/delete-refuse.log") != *'1) 链接/二维码'* ]]
+ node_menu > "$ROOT/delete-accept.log" <<'INPUT'
+5
+1
+y
+INPUT
+ [[ ! -e $STACK_DIR/nodes/1 && -f $STACK_DIR/nodes/2/metadata.json ]]
+ [[ $(cat "$ROOT/delete-effects") == *'node=1 down'* ]]
+ [[ $(cat "$ROOT/delete-effects") != *'node=2'* && $(cat "$ROOT/delete-effects") != *'volume'* && $(cat "$ROOT/delete-effects") != *'apt'* ]]
+ [[ $(cat "$ROOT/delete-accept.log") == *'保留其他节点、Docker、系统依赖和证书卷'* ]]
+ # 管理菜单 6 使用同一删除逻辑。
+ cmd_node_manage > "$ROOT/delete-manage.log" <<'INPUT'
+1
+6
+y
+INPUT
+ [[ ! -e $STACK_DIR/nodes/2 && $(cat "$ROOT/delete-effects") == *'node=2 down'* ]]
+ echo 'PASS direct-delete-confirm-refusal-and-target-scope'
 )
 
 TEST
