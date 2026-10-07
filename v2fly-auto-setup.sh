@@ -15,6 +15,7 @@ set -euo pipefail
 STACK_DIR=/root/v2fly-stack
 MIN_COMPOSE=2.23.1
 OS_FAMILY=""
+QR_INSTALL_ATTEMPTED=no
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -176,7 +177,10 @@ prepare_environment() {
 
 ensure_node_environment() {
   local status
-  if check_node_environment; then return 0; else status=$?; fi
+  if check_node_environment; then
+    prepare_low_memory || return 1
+    return 0
+  else status=$?; fi
   [[ $status != 2 ]] || return 1
   ylw '创建节点前需要补齐以下环境：'
   printf '  - %s\n' "${ENV_MISSING[@]}"
@@ -305,6 +309,7 @@ prepare_low_memory() {
 
 install_qrencode_el9() {
   command -v qrencode >/dev/null && return 0
+  QR_INSTALL_ATTEMPTED=yes
   dnf install -y qrencode && return 0
   if ! rpm -q epel-release >/dev/null 2>&1; then
     if ! confirm "当前源无可用 qrencode。是否添加 Fedora 官方 EPEL 9 外部软件源后安装二维码工具？" n; then
@@ -338,6 +343,7 @@ install_deps() {
     fi
     install_qrencode_el9 || return 1
   else
+    command -v qrencode >/dev/null || QR_INSTALL_ATTEMPTED=yes
     for p in curl ca-certificates qrencode openssl python3 iproute2; do
       dpkg -s "$p" &>/dev/null || pkgs+=("$p")
     done
@@ -987,9 +993,37 @@ node_ingress_select() {
   done
 }
 
+ensure_qrencode() {
+  command -v qrencode >/dev/null && return 0
+  if [[ $QR_INSTALL_ATTEMPTED == yes ]]; then
+    ylw '本次已尝试安装二维码工具，继续使用客户端链接。'; return 1
+  fi
+  ylw '缺少二维码工具 qrencode；复制客户端链接仍可使用。'
+  confirm '是否安装二维码工具？' n || return 1
+  QR_INSTALL_ATTEMPTED=yes
+  local family=${OS_FAMILY:-}
+  if [[ -z $family ]]; then
+    family=$(detect_os && printf '%s' "$OS_FAMILY") || { ylw '无法确定支持的系统，跳过二维码安装。'; return 1; }
+  fi
+  [[ $family == el9 || $family == debian ]] || { ylw '当前系统不支持二维码工具自动安装，请使用链接。'; return 1; }
+  prepare_low_memory || return 1
+  case $family in
+    el9) install_qrencode_el9 || { ylw '二维码工具安装失败，请使用链接。'; return 1; } ;;
+    debian)
+      if ! apt-get update -qq || ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; then
+        ylw '二维码工具安装失败，请使用链接。'; return 1
+      fi
+      ;;
+    *) ylw '当前系统不支持二维码工具自动安装，请使用链接。'; return 1 ;;
+  esac
+  if ! command -v qrencode >/dev/null; then
+    ylw '二维码工具仍不可用，请使用客户端链接。'; return 1
+  fi
+}
+
 show_qr() {
   local link=$1 cols width level selected='' output
-  command -v qrencode >/dev/null || return 0
+  ensure_qrencode || return 0
   cols=$(tput cols 2>/dev/null || printf 80)
   [[ $cols =~ ^[0-9]+$ ]] || cols=80
   for level in M L; do

@@ -45,9 +45,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup
 0) 退出
 ```
 
-可直接选择「新增节点」：脚本先检查系统、基础依赖和 Docker / Compose。环境已就绪时直接继续；缺少依赖或 Docker 服务未启动时，列出问题并询问是否准备环境，确认后安装缺项、启动服务，复检通过后自动继续创建。拒绝、输入结束或准备失败时停止，不创建节点。
+可直接选择「新增节点」：脚本先检查系统、基础依赖和 Docker / Compose。核心依赖已就绪时继续检查内存 / Swap；缺少依赖或 Docker 服务未启动时，列出问题并询问是否准备环境，确认后安装缺项、启动服务，复检通过后自动继续创建。拒绝、输入结束或准备失败时停止，不创建节点。
 
-「初始化环境」仍可独立使用，不创建节点。已有 Compose 版本低于要求或检测到 Podman 冲突时，会提示先自行处理，不自动替换已有组件。仅缺少可选二维码工具不会阻止新增节点。创建或更新节点时会拉取所需容器镜像。
+「初始化环境」仍可独立使用，不创建节点。已有 Compose 版本低于要求或检测到 Podman 冲突时，会提示先自行处理，不自动替换已有组件。仅缺少可选二维码工具不会阻止新增节点；显示链接时会提示缺失，并提供可选安装。创建或更新节点时会拉取所需容器镜像。
 
 新增节点先选择「本机节点」或「中转节点」，再输入名称、选择入口域名。端口、UUID、路径及镜像标签有默认值，需要时进入高级设置修改。中转节点再填写远端连接参数。输入 `0` 可返回。
 
@@ -85,7 +85,7 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v
 - 已有 Docker 时保留引擎。缺少 Compose 时下载固定版本 v2.24.7 的官方插件，并校验 SHA-256；该插件不会由系统包管理器自动更新。
 - EL9 新装 Docker 使用 Docker 官方 CentOS RPM 软件源。遇到 Podman 兼容命令或包冲突时停止，不自动卸载其他软件。
 - 核验 `curl`、`openssl`、`python3`、`ss`、`ip` 和 `ca-certificates`。二维码工具 `qrencode` 可选；缺失时仍可输出客户端链接。EL9 需要 EPEL 时会询问，默认不添加。
-- 内存不足 1 GiB 且无活动 Swap 时，询问是否创建 1 GiB Swap，默认不创建；拒绝则停止初始化。创建前检查 ext4 / XFS 和至少 2 GiB 可用磁盘，不覆盖已有 `/swapfile`，并备份 `/etc/fstab`。已有 Swap 保留。
+- 新增节点和环境初始化都会检查内存 / Swap，包括 Docker 和依赖已齐全的机器。内存不足 1 GiB 且无活动 Swap 时，询问是否创建 1 GiB Swap，默认不创建；拒绝则停止此次新增或初始化。创建前检查 ext4 / XFS 和至少 2 GiB 可用磁盘，不覆盖已有 `/swapfile`，并备份 `/etc/fstab`。已有 Swap 保留。
 
 Caddy 入口需要 TCP 80/443。脚本可处理活动的 ufw / firewalld；不会启动未运行的 firewalld。已有 Nginx 模式不修改防火墙。云厂商安全组需自行放行。
 
@@ -118,7 +118,7 @@ SELinux 保持开启；脚本不修改已有 Nginx 的全局 SELinux 策略。�
 
 「所有节点状态」显示节点容器、实际运行版本和镜像，并单独显示共享 Caddy 状态；按域名读取本机 HTTPS 入口的证书签发者与到期时间。证书尚未就绪时给出提示。
 
-节点链接和二维码通过「管理节点 → 链接/二维码」查看。二维码按终端宽度选择纠错等级；窗口过窄或工具不可用时保留导入链接。客户端参数为 VMess、WebSocket、TLS、端口 443、alterId 0，域名、UUID 和路径使用节点输出。
+节点链接和二维码通过「管理节点 → 链接/二维码」查看。二维码按终端宽度选择纠错等级。缺少 `qrencode` 时提示并询问是否安装；CentOS Stream 9 / Rocky 9 / AlmaLinux 9 先尝试现有源，必要时再询问是否添加官方 EPEL 9 源。拒绝、安装失败或窗口过窄时保留导入链接，不影响已创建节点。客户端参数为 VMess、WebSocket、TLS、端口 443、alterId 0，域名、UUID 和路径使用节点输出。
 
 修改、重启、更新及删除只操作选中的节点容器。Caddy 是共享入口：入口路径发生变化时需要重载，现有 WebSocket 连接可能重连。
 
@@ -162,6 +162,7 @@ bash tests/swap.sh
 bash tests/nodes.sh
 bash tests/management.sh
 bash tests/environment.sh
+bash tests/qr-install.sh
 ```
 
 测试需要 Bash 和 Python 3，使用临时目录和模拟命令，不下载依赖、不操作真实 Docker 或系统配置。模拟测试不能代替支持系统上的真实部署验证。
