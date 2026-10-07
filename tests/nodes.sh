@@ -111,7 +111,7 @@ echo 'PASS guarded-legacy-overwrite'
   node_python create jp kr.example.com nginx relay 2335 /jp "$U" v2fly/v2fly-core:5.41.0 manual jp.example.com 443 "$U" /remote
   preflight(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }
   docker(){ if [[ $* == *'{{.Image}}'* ]]; then echo sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; elif [[ $1 == inspect ]]; then return 1; fi; }
-  ask(){ printf '%s' "$2"; }
+  node_ask(){ printf '%s' "$2"; }
   confirm(){ [[ $1 != *'高级设置'* ]]; }
   node_apply(){ echo "$NODE_ID" >> "$ROOT/applied"; }
   node_show(){ :; }
@@ -141,6 +141,95 @@ echo 'PASS guarded-legacy-overwrite'
  docker(){ return 0; }
  if node_owner v2ray-node-test v2ray-node-test; then exit 1; fi
  echo 'PASS unlabeled-container-ownership'
+)
+
+# 名称验证、数字序号与已有目录保护；删除后仍递增。
+(
+ STACK_DIR="$ROOT/numeric"
+ [[ $(node_python validate-label '  韩国直出  ') == 韩国直出 ]]
+ if node_python validate-label '   '; then exit 1; fi
+ [[ ! -e $STACK_DIR ]]
+ [[ $(node_python allocate) == 1 ]]
+ node_python create 1 one.example.com nginx direct 2334 /one "$U" v2fly/v2fly-core:latest
+ NODE_ID=1; [[ $(node_get id) == 1 ]]
+ rm -rf "$STACK_DIR/nodes/1"
+ [[ $(node_python allocate) == 2 ]]
+ mkdir "$STACK_DIR/nodes/8"
+ [[ $(node_python allocate) == 9 ]]
+ for i in 1 2 3 4; do node_python allocate > "$ROOT/allocation-$i" & done
+ wait
+ [[ $(cat "$ROOT"/allocation-* | sort -n | tr '\n' ' ') == '10 11 12 13 ' ]]
+ [[ $(cat "$STACK_DIR/nodes/.id-sequence") == 13 ]]
+ echo 'PASS numeric-highwater-existing-directory-and-concurrency'
+)
+# 使用真实 read 模拟输入，避免 ask 的子 shell 丢失队列状态。
+(
+ STACK_DIR="$ROOT/fresh-menu"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
+ preflight(){ :; }; need_docker(){ :; }; ss(){ :; }; port_in_use(){ return 1; }
+ docker(){ if [[ $1 == inspect ]]; then return 1; fi; }
+ node_apply(){ :; }; node_show(){ :; }
+ cmd_node_add > "$ROOT/fresh-menu.log" <<'INPUT'
+韩国直出
+99
+1
+bad domain
+fresh.example.com
+n
+9
+1
+y
+INPUT
+ NODE_ID=1
+ [[ $(node_get label) == 韩国直出 && $(node_get front) == caddy ]]
+ [[ $(cat "$STACK_DIR/nodes/.id-sequence") == 1 ]]
+ [[ $(cat "$ROOT/fresh-menu.log") == *'暂无已登记的入口'* ]]
+ [[ $(cat "$ROOT/fresh-menu.log") != *'节点标识'* ]]
+ # 最终取消不分配序号、不增加目录。
+ cmd_node_add > "$ROOT/cancel-menu.log" <<'INPUT'
+取消测试
+1
+n
+1
+n
+INPUT
+ [[ $(cat "$STACK_DIR/nodes/.id-sequence") == 1 && ! -e $STACK_DIR/nodes/2 ]]
+ echo 'PASS fresh-create-invalid-retry-and-final-cancel'
+)
+(
+ STACK_DIR="$ROOT/reuse-menu"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/compose.yaml"
+ node_python create legacy a.example.com nginx direct 2334 /a "$U" v2fly/v2fly-core:latest
+ node_python create duplicate a.example.com nginx direct 2335 /b "$U" v2fly/v2fly-core:latest
+ node_python create second b.example.com nginx direct 2336 /c "$U" v2fly/v2fly-core:latest
+ edit=no; d=''; front=''; port_in_use(){ return 1; }
+ node_ingress_select > "$ROOT/reuse-menu.log" <<'INPUT'
+99
+2
+INPUT
+ [[ $d == b.example.com && $front == nginx ]]
+ [[ $(node_python entries | wc -l | tr -d ' ') == 2 ]]
+ node_owner(){ :; }
+ node_select > "$ROOT/select-menu.log" <<'INPUT'
+99
+2
+INPUT
+ [[ $NODE_ID == legacy ]]
+ if node_select <<<'0'; then exit 1; fi
+ echo 'PASS deduplicated-reuse-numbered-legacy-selection-and-cancel'
+)
+(
+ STACK_DIR="$ROOT/busy-menu"; edit=no; d=''; front=''; port_in_use(){ return 0; }
+ node_ingress_select > "$ROOT/busy-menu.log" <<'INPUT'
+
+existing.example.com
+INPUT
+ [[ $front == nginx && $d == existing.example.com && ! -e $STACK_DIR ]]
+ if node_ingress_select <<<'0'; then exit 1; fi
+ if node_ingress_select </dev/null; then exit 1; fi
+ node_select </dev/null && exit 1
+ preflight(){ :; }; need_docker(){ :; }; ss(){ :; }; docker(){ :; }
+ cmd_node_add </dev/null
+ [[ ! -e $STACK_DIR ]]
+ echo 'PASS fresh-busy-default-and-no-write-on-return'
 )
 
 TEST

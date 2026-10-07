@@ -1187,7 +1187,7 @@ cmd_uninstall() {
 node_python() {
   command -v python3 >/dev/null || { red '多节点管理需要 python3，请先手动安装。'; return 1; }
   python3 - "$STACK_DIR" "$@" <<'PY'
-import sys,os,json,re,uuid,base64,pathlib
+import sys,os,json,re,uuid,base64,pathlib,fcntl
 root=pathlib.Path(sys.argv[1]); action=sys.argv[2]; args=sys.argv[3:]
 nodes=root/'nodes'
 def fail(s): raise ValueError(s)
@@ -1198,7 +1198,7 @@ def path(s):
  if not re.fullmatch(r'/[A-Za-z0-9._~-]+',s): fail('路径只能包含字母、数字和 . _ ~ -')
  return s
 def ident(s):
- if not re.fullmatch(r'[a-z][a-z0-9-]{0,31}',s): fail('节点标识须为小写字母开头，最多 32 个字母、数字或横线')
+ if not re.fullmatch(r'(?:[1-9][0-9]*|[a-z][a-z0-9-]{0,31})',s): fail('节点标识须为小写字母开头，最多 32 个字母、数字或横线')
  return s
 def port(s):
  n=int(s)
@@ -1255,7 +1255,25 @@ def ingress():
   text='name: v2ray-ingress\nservices:\n  caddy:\n    image: caddy:'+tag+'\n    container_name: v2ray-ingress\n    restart: unless-stopped\n    command: caddy run --config /managed/Caddyfile --adapter caddyfile\n    ports:\n      - "80:80"\n      - "443:443"\n    volumes:\n      - ./ingress:/managed:ro,Z\n      - node_caddy_data:/data\n      - node_caddy_config:/config\nvolumes:\n  node_caddy_data:\n  node_caddy_config:\n'
  write(root/'ingress.yaml',text)
 try:
- if action=='create':
+ if action=='allocate':
+  nodes.mkdir(parents=True,exist_ok=True);os.chmod(nodes,0o700)
+  with open(nodes/'.id-sequence','a+') as f:
+   os.chmod(nodes/'.id-sequence',0o600);fcntl.flock(f,fcntl.LOCK_EX);f.seek(0)
+   saved=f.read().strip();high=int(saved or '0')
+   high=max([high]+[int(p.name) for p in nodes.iterdir() if p.name.isdigit()])
+   while (nodes/str(high+1)).exists():high+=1
+   s=str(high+1);(nodes/s).mkdir(mode=0o700)
+   f.seek(0);f.truncate();f.write(s+'\n');f.flush();os.fsync(f.fileno());print(s)
+ elif action=='validate-label':
+  label=args[0].strip()
+  if not label or len(label)>80 or any(ord(c)<32 for c in label):fail('节点名称须为 1–80 个可见字符')
+  print(label)
+ elif action=='validate-domain':print(domain(args[0].strip()))
+ elif action=='entries':
+  env=legacy();entries={(n['domain'].lower(),n['front']) for n in allnodes()}
+  if env.get('DOMAIN'):entries.add((domain(env['DOMAIN']),env.get('FRONT','caddy')))
+  for d,front in sorted(entries):print(d+'\t'+front)
+ elif action=='create':
   s,d,front,out,p,ws,u,image=args[:8];ident(s);d=domain(d);path(ws);port(p);uuid.UUID(u)
   if front not in ('nginx','caddy') or out not in ('direct','relay'):fail('入口或出口方式不正确')
   if not re.fullmatch(r'(?:v2fly/v2fly-core:[A-Za-z0-9_.-]+|sha256:[a-f0-9]{64})',image):fail('镜像标签不正确')
@@ -1396,15 +1414,82 @@ node_owner() {
   fi
 }
 
+node_ask() {
+  local reply
+  read -r -u "$IN" -p "$1${2:+ [$2]}: " reply || return 1
+  printf '%s' "${reply:-$2}"
+}
+
 node_option() {
   if [[ $advanced == yes ]]; then ask "$1" "$2"; else printf '%s' "$2"; fi
 }
 
 node_select() {
-  node_python list || return 1
-  NODE_ID=$(ask '节点标识（旧节点请使用旧 show/status 子命令）' '')
+  local choice i=0 id listing
+  local ids=()
+  listing=$(node_python ids) || return 1
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    ids+=("$id"); i=$((i+1))
+    printf '%s) %s (%s)\n' "$i" "$(node_python get "$id" label 2>/dev/null || printf '%s' "$id")" "$id"
+  done <<< "$listing"
+  if (( ${#ids[@]} == 0 )); then ylw '暂无可管理的新节点；旧节点使用旧菜单管理。'; return 1; fi
+  echo '0) 返回'
+  while true; do
+    choice=$(node_ask '选择节点' '1') || return 1
+    [[ $choice != 0 ]] || return 1
+    if [[ $choice =~ ^[1-9][0-9]*$ ]] && (( ${#choice} < 10 && choice <= ${#ids[@]} )); then break; fi
+    ylw '选择无效，请输入列表中的编号。'
+  done
+  NODE_ID=${ids[choice-1]}
   node_get id >/dev/null || return 1
   node_owner "v2ray-node-$NODE_ID" "v2ray-node-$NODE_ID" || return 1
+}
+
+node_choice() {
+  local choice
+  while true; do
+    choice=$(node_ask "$1" "$2") || { printf 0; return; }
+    if [[ $choice =~ ^[0-9]$ && $3 == *"$choice"* ]]; then printf '%s' "$choice"; return; fi
+    ylw '选择无效，请输入列表中的编号。' >&2
+  done
+}
+
+node_ingress_select() {
+  local entry domain choice listing i=0 default='' current_domain='' current_front='' busy=no
+  local domains=() fronts=()
+  if [[ $edit == yes ]]; then current_domain=$(node_get domain); current_front=$(node_get front); fi
+  listing=$(node_python entries) || return 1
+  while IFS=$'\t' read -r domain front; do
+    [[ -n $domain ]] || continue
+    domains+=("$domain"); fronts+=("$front"); i=$((i+1))
+    printf '%s) 复用 %s (%s)\n' "$i" "$domain" "$front"
+    if [[ $domain == "$current_domain" && $front == "$current_front" ]]; then default=$i; fi
+  done <<< "$listing"
+  if (( i == 0 )); then ylw '暂无已登记的入口，请选择新域名；已有手工配置不会自动导入。'; fi
+  local caddy=$((i+1)) nginx=$((i+2))
+  printf '%s) Caddy 新域名\n%s) 已有 Nginx 新域名\n0) 返回\n' "$caddy" "$nginx"
+  if port_in_use 80 || port_in_use 443; then busy=yes; fi
+  if [[ -z $default ]]; then
+    if (( i > 0 )); then default=1
+    elif [[ $busy == yes ]]; then default=$nginx
+    else default=$caddy; fi
+  fi
+  while true; do
+    choice=$(node_ask '入口选择' "$default") || return 1
+    [[ $choice != 0 ]] || return 1
+    if [[ ! $choice =~ ^[1-9][0-9]*$ ]] || (( ${#choice} >= 10 || choice > nginx )); then ylw '选择无效，请输入列表中的编号。'; continue; fi
+    if (( choice <= i )); then d=${domains[choice-1]}; front=${fronts[choice-1]}; return; fi
+    if (( choice == caddy )); then front=caddy; else front=nginx; fi
+    if [[ $front == caddy && $busy == yes ]] && ! container_running caddy && ! container_running v2ray-ingress; then
+      ylw '80/443 已被占用，请选择已有 Nginx 或复用已登记入口。'; continue
+    fi
+    while true; do
+      d=$(node_ask '入口域名（0 返回）' "$current_domain") || return 1
+      [[ $d != 0 ]] || return 1
+      if d=$(node_python validate-domain "$d"); then return; fi
+    done
+  done
 }
 
 node_show() {
@@ -1515,41 +1600,13 @@ cmd_node_add() {
   local tool
   for tool in python3 curl openssl ss; do command -v "$tool" >/dev/null || { red "缺少 ${tool}，请先手动安装再新增节点。"; return 1; }; done
   command -v python3 >/dev/null || { red '请手动安装 python3 后再管理多节点。'; return 1; }
-  if [[ $edit == no ]]; then
-    NODE_ID=$(ask '节点标识，例如 kr-direct 或 kr-jp' '')
-    [[ $NODE_ID =~ ^[a-z][a-z0-9-]{0,31}$ ]] || { red '节点标识格式不正确'; return 1; }
-    [[ ! -e $STACK_DIR/nodes/$NODE_ID ]] || { red '节点已存在，请使用管理节点'; return 1; }
-  else existed=yes; previousimage=$(node_get image) || return 1; fi
-  label=$(ask '节点名称，例如 韩国直出 / 韩国转日本' "$(if [[ $edit == yes ]]; then node_get label 2>/dev/null || node_get id; else echo "$NODE_ID"; fi)")
-  node_python list
-  echo '入口：1) 复用已有域名  2) Caddy 新域名  3) 已有 Nginx 新域名'
-  mode=$(ask '入口选择' '1')
-  d=$(ask '入口域名' "$( [[ $edit == yes ]] && node_get domain || true )")
-  d=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')
-  case $mode in
-    1)
-      front=$(python3 - "$STACK_DIR" "$d" <<'PY'
-import sys,pathlib,json
-r=pathlib.Path(sys.argv[1]);d=sys.argv[2];found=''
-for p in (r/'nodes').glob('*/metadata.json'):
- n=json.loads(p.read_text())
- if n['domain']==d:found=n['front']
-e={}
-if (r/'.env').exists():
- for l in (r/'.env').read_text().splitlines():
-  if '=' in l:k,v=l.split('=',1);e[k]=v
- if e.get('DOMAIN')==d:found=e.get('FRONT','caddy')
-print(found)
-PY
-)
-      [[ -n $front ]] || { red '没有找到可复用的域名，请选择新域名入口'; return 1; } ;;
-    2) front=caddy ;;
-    3) front=nginx ;;
-    *) return 1 ;;
-  esac
-  if [[ $front == caddy ]] && ! container_running caddy && ! container_running v2ray-ingress; then
-    if port_in_use 80 || port_in_use 443; then red '80/443 已被占用，请选择已有 Nginx'; return 1; fi
-  fi
+  if [[ $edit == yes ]]; then existed=yes; previousimage=$(node_get image) || return 1; else NODE_ID=''; fi
+  while true; do
+    label=$(node_ask '节点名称，例如 韩国直出 / 韩国转日本（0 返回）' "$(if [[ $edit == yes ]]; then node_get label 2>/dev/null || node_get id; fi)") || return 0
+    [[ $label != 0 ]] || return 0
+    if label=$(node_python validate-label "$label"); then break; fi
+  done
+  node_ingress_select || return 0
   if confirm '是否修改高级设置（端口、UUID、路径、镜像）？' n; then advanced=yes; fi
   p=$(node_option '本地端口' "$(if [[ $edit == yes ]]; then node_get port; else python3 - "$STACK_DIR" <<'PY'
 import sys,json,pathlib,socket
@@ -1567,13 +1624,19 @@ fi)")
   ws=$(node_option 'WebSocket 路径' "$(if [[ $edit == yes ]]; then node_get path; else printf '/%s' "$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"; fi)")
   u=$(node_option 'UUID' "$(if [[ $edit == yes ]]; then node_get uuid; else python3 -c 'import uuid;print(uuid.uuid4())'; fi)")
   image=$(node_option 'V2Fly 镜像标签' "$(if [[ $edit == yes ]]; then node_get image | sed 's|v2fly/v2fly-core:||'; else echo latest; fi)"); [[ $image == sha256:* ]] || image="v2fly/v2fly-core:$image"
-  echo '出口：1) 本机直出  2) 远端 VMess + WS + TLS 中转（失败不直出）'
-  mode=$(ask '出口选择' "$(if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo 2; else echo 1; fi)"); out=direct
+  printf '%s\n' '1) 本机直出' '2) 远端 VMess + WS + TLS 中转（失败不直出）' '0) 返回'
+  mode=$(node_choice '出口选择' "$(if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo 2; else echo 1; fi)" '012'); out=direct
   local remote_args=()
   case $mode in
     1) ;;
     2)
-      out=relay; mode=$(ask '远端配置：1) 导入 vmess:// 链接  2) 手动填写  3) 保留现有远端（修改时）' "$(if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo 3; else echo 1; fi)")
+      out=relay
+      printf '%s\n' '1) 导入 vmess:// 链接' '2) 手动填写'
+      local remote_choices=012
+      if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo '3) 保留现有远端'; remote_choices=0123; fi
+      echo '0) 返回'
+      mode=$(node_choice '远端配置' "$(if [[ $edit == yes && $(node_get outbound) == relay ]]; then echo 3; else echo 1; fi)" "$remote_choices")
+      [[ $mode != 0 ]] || return 0
       if [[ $mode == 1 ]]; then link=$(ask '日本节点 vmess:// 链接' ''); remote_args=(link "$link")
       elif [[ $mode == 2 ]]; then
         rd=$(ask '远端域名' ''); rp=$(ask '远端端口' '443'); ru=$(ask '远端 UUID' ''); rw=$(ask '远端 WS 路径' '')
@@ -1582,11 +1645,13 @@ fi)")
       elif [[ $mode == 3 && $edit == yes && $(node_get outbound) == relay ]]; then
         remote_args=(preserve)
       else return 1; fi ;;
+    0) return 0 ;;
     *) return 1 ;;
   esac
-  echo "节点 ${NODE_ID}；入口 ${d}${ws} (${front})；本地端口 ${p}；出口 ${out}"
+  echo "节点 ${label} (${NODE_ID:-自动编号})；入口 ${d}${ws} (${front})；本地端口 ${p}；出口 ${out}"
   [[ $front != nginx ]] || ylw '创建后仍需手动添加 Nginx 路径配置。'
   confirm '确认应用此节点？' n || return 0
+  if [[ $edit == no ]]; then NODE_ID=$(node_python allocate) || return 1; fi
   mkdir -p "$STACK_DIR/nodes"; chmod 700 "$STACK_DIR/nodes"
   node_owner "v2ray-node-$NODE_ID" "v2ray-node-$NODE_ID" || return 1
   backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX"); chmod 700 "$backup"
@@ -1599,7 +1664,7 @@ fi)")
     [[ -n $oldimage ]] || { NODE_TX_ACTIVE=no; red "无法读取旧镜像 ID，停止修改；备份：$backup"; return 1; }
     image=$oldimage
   fi
-  if ! node_python create "$NODE_ID" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" "${remote_args[@]}"; then
+  if ! node_python create "$NODE_ID" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" ${remote_args[@]+"${remote_args[@]}"}; then
     if [[ $existed == yes ]]; then
       node_restore_files "$backup" || return 1
     else rm -rf "$STACK_DIR/nodes/$NODE_ID"; fi
@@ -1622,8 +1687,8 @@ fi)")
 
 cmd_node_manage() {
   need_docker; node_select || return 1
-  echo '1) 链接/二维码  2) 修改  3) 测试连接  4) 日志  5) 重启  6) 删除  7) 更新镜像'
-  case "$(ask '操作' '1')" in
+  printf '%s\n' '1) 链接/二维码' '2) 修改' '3) 测试连接' '4) 日志' '5) 重启' '6) 删除' '7) 更新镜像' '0) 返回'
+  case "$(node_choice '操作' '1' '01234567')" in
     1) node_show ;;
     2) cmd_node_add yes ;;
     3) node_test ;;
@@ -1675,9 +1740,8 @@ cmd_nodes_status() {
 node_menu() {
   echo '======== V2Fly 多节点管理 ========'
   node_python list || return 1
-  echo '1) 新增节点  2) 管理节点  3) 所有节点状态  4) 更新指定节点  5) 卸载（逐个选择节点删除）'
-  echo '6) 旧单节点菜单  0) 退出'
-  case "$(ask '请选择' '')" in
+  printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 卸载（逐个选择节点删除）' '6) 旧单节点菜单' '0) 退出'
+  case "$(node_choice '请选择' '0' '0123456')" in
     1) cmd_node_add ;;
     2|5) cmd_node_manage ;;
     3) cmd_nodes_status ;;
