@@ -217,7 +217,7 @@ if [[ $TEST == same-domain ]]; then
  assert cmp "$ROOT/$TEST.first" "$STACK_DIR/nodes/1/metadata.json"
  assert test "$(node_get port)" != 2333
  assert test "$(node_get path)" != /first
- for route in v2ray-node-1:2333 v2ray-node-2:2333; do
+ for route in v2fly-node-1:2333 v2fly-node-2:2333; do
   [[ $(cat "$STACK_DIR/ingress/Caddyfile") == *"$route"* ]] || exit 1
  done
 fi
@@ -277,7 +277,7 @@ source "$SCRIPT"
 STACK_DIR="$ROOT/certificate-check"
 LOG="$ROOT/certificate-read.events"
 : > "$LOG"
-CERT_STATUS=0; CERT_CODE=502; OWNER=v2ray-ingress; PRESENT=yes; VOLUME=yes
+CERT_STATUS=0; CERT_CODE=502; OWNER=v2fly-ingress; PRESENT=yes; VOLUME=yes
 RAW=''; HAVE_PY=yes
 command(){
  if [[ ${1:-} == -v ]]; then
@@ -317,7 +317,7 @@ result=$(check caddy)
 echo PASS certificate-untrusted
 CERT_STATUS=7; PRESENT=no; VOLUME=yes
 result=$(check caddy)
-[[ $result == *'预期证书卷 v2ray-ingress_node_caddy_data 已存在'* && $result == *'无法判断磁盘是否已有证书'* ]]
+[[ $result == *'预期证书卷 v2fly-ingress_node_caddy_data 已存在'* && $result == *'无法判断磁盘是否已有证书'* ]]
 echo PASS certificate-offline-volume-exists
 VOLUME=no
 result=$(check caddy)
@@ -327,7 +327,7 @@ PRESENT=yes; OWNER=foreign
 result=$(check caddy)
 [[ $result == *'不是本项目资源'* && $result != *'custom_certificate_volume'* ]]
 echo PASS certificate-foreign-container
-OWNER=v2ray-ingress
+OWNER=v2fly-ingress
 : > "$LOG"
 result=$(check nginx)
 [[ $result == *'由现有 Nginx / 宝塔管理'* && $(cat "$LOG") != *docker* ]]
