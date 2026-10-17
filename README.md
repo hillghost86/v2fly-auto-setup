@@ -1,172 +1,279 @@
-# v2fly-auto-setup.sh
+# V2Fly Auto Setup
 
-在 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 或 CentOS Stream 9 上，通过 Docker 管理多个 **V2Fly v5** 节点，使用 **VMess + WebSocket + TLS**。每个节点独立运行一个 V2Fly 容器，支持本机直出和远端中转。
+**在一台服务器上创建多个代理节点，按需选择本机直出或远端中转。**
 
-这是采用多节点架构的大版本：只管理本版本创建的节点，不读取、接管或迁移旧单节点配置，不提供旧单节点菜单。部署目录固定为 `/root/v2fly-stack`；不会自动删除旧目录或旧服务。旧服务占用端口时，需要自行处理冲突，或使用已有 Nginx 入口。
+通过 Docker 部署 V2Fly v5，使用 **VMess + WebSocket + TLS**。每个节点独立运行，共用 HTTPS 入口；支持 Caddy 自动管理证书，也支持接入已有 Nginx / 宝塔站点。
 
-## 线路与入口
+[发布版本 0.3.0](https://github.com/hillghost86/v2fly-auto-setup/releases/tag/0.3.0) · [快速开始](#快速开始) · [宝塔接入](#宝塔--已有-nginx) · [常见问题](#常见问题)
 
-例如在韩国服务器创建两个节点：
+> **从旧版本升级？先看这里。**
+>
+> `0.3.0` 不支持直接管理 `0.2.0` 或旧单节点版本创建的资源。请先备份节点信息和证书，用旧版管理方式清理旧部署，再重新创建节点。
+>
+> 两版都使用 `/root/v2fly-stack`，仅替换脚本并不等于完成升级。新版不会自动迁移旧容器或证书卷，也不会自动删除旧资源。重新申请证书可能遇到签发限流。
 
-| 客户端节点 | 连接线路 | 网站看到的出口 |
+## 能做什么
+
+例如，在韩国服务器创建两个节点：
+
+| 客户端里选择 | 数据经过的线路 | 网站看到的出口 |
 | --- | --- | --- |
-| 韩国直出 | Shadowrocket → 韩国 → 网站 | 韩国服务器 |
-| 韩国转日本 | Shadowrocket → 韩国 → 日本 → 网站 | 日本服务器 |
+| 韩国直出 | 你的设备 → 韩国 → 网站 | 韩国服务器 |
+| 韩国转日本 | 你的设备 → 韩国 → 日本 → 网站 | 日本服务器 |
 
-分别导入两条 `vmess://` 链接，在客户端切换即可。规则模式下被设置为直连的请求不会经过节点。中转出口支持 VMess + WebSocket + TLS，可导入远端链接或手动输入连接参数；中转失败不会自动改为本机直出。
+把两条链接分别导入 Shadowrocket 等客户端，需要哪条线路就切换到哪个节点。**中转失败时，不会自动改为本机直出。** 客户端规则中设为直连的请求仍然直接连接，不经过节点。
 
-每个节点有独立的数字编号、名称、UUID、WebSocket 路径、本地端口及出口配置。编号自动递增，删除后不重新使用。HTTPS 入口可以共用域名和 443，通过不同路径分发。
+- **多个节点独立管理**：每个节点有自己的名称、UUID、路径、本地端口和容器。
+- **同域名复用**：不同节点可以共用域名和 443 端口，通过不同 WebSocket 路径转发。
+- **远端链接导入**：创建中转节点时，粘贴远端 `vmess://` 链接即可解析并核对连接参数。
+- **先填写，再执行**：安装依赖、创建 Swap 和部署容器，都在最终确认后进行。
 
-| 入口 | 容器与证书 | 用户操作 |
+## 快速开始
+
+### 1. 准备服务器与域名
+
+| 项目 | 要求 |
+| --- | --- |
+| 系统 | Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9、CentOS Stream 9 |
+| 权限 | root；系统使用 systemd |
+| 域名 | 已解析到这台服务器 |
+| 网络 | 放行入口所需的 TCP 80、443，包括云厂商安全组 |
+| 中转节点 | 另有一个可用的 VMess + WebSocket + TLS 远端节点 |
+
+不支持 CentOS Linux、CentOS Stream 8 或 RHEL。已有 Docker 可以继续使用；其他缺失的依赖会在确认后准备。
+
+### 2. 选择入口方式
+
+| 服务器情况 | 应该选什么 | 证书由谁管理 |
 | --- | --- | --- |
-| Caddy | 各节点独立容器，共享 Caddy 入口及证书 | 域名解析到服务器，并放行 TCP 80/443 |
-| 已有 Nginx / 宝塔 | 各节点端口绑定回环地址，证书由现有站点管理 | 将脚本输出的路径转发片段加入 HTTPS 站点 |
+| 没有网站服务，80/443 空闲 | Caddy 新域名 | Caddy 自动申请和续期 |
+| 已有 Nginx 或宝塔网站 | 已有 Nginx 新域名 | 原站点管理 |
+| 已用本脚本创建过同域名节点 | 复用列表中的域名 | 沿用原入口 |
 
-同一服务器上的脚本节点使用同一种入口管理方式，避免 Caddy 与 Nginx 争用 80/443。入口菜单只列出本版本登记的域名；域名已经解析并不代表存在可复用入口。
+同一台服务器上的脚本节点须使用同一种入口方式，避免 Caddy 与 Nginx 争用端口。**域名已经解析，不等于已有可复用入口**；菜单只列出脚本登记过的入口。
 
-## 开始使用
+### 3. 运行脚本
 
-需要 root 权限、systemd，以及解析到服务器的域名。先执行 `sudo -i`，然后运行：
+先使用 `sudo -i` 切换到 root；已经是 root 则无需执行。
+
+推荐使用固定版本，方便复现配置和排查问题：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh)
+```
+
+<details>
+<summary>使用 main 最新代码，或下载到本地运行</summary>
+
+`main` 可能包含尚未发布的新改动：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v2fly-auto-setup.sh)
 ```
 
-主菜单：
+下载固定版本：
 
-```text
-1) 新增节点
-2) 管理节点
-3) 所有节点状态
-4) 更新指定节点
-5) 删除节点
-6) 初始化环境
-7) 更新共享 Caddy
-0) 退出
+```bash
+curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh -o v2fly-auto-setup.sh
+bash v2fly-auto-setup.sh
 ```
 
-可直接选择「新增节点」，整个流程分为五个阶段：
+不要使用 `sudo bash <(curl ...)`，它可能无法读取进程替换生成的脚本。先切换到 root，或使用管道形式：
 
-1. **只读检查**：检查系统、依赖、Docker、内存 / Swap 和二维码工具，不安装或修改配置。
-2. **填写信息**：依次填写节点类型、名称、HTTPS 入口、高级设置和中转参数。每一步有短分界线、编号与标题，同组字段之间留空行。
-3. **汇总确认**：查看节点配置及需要执行的环境准备项目，提前选择 Swap 和二维码安装策略，最后统一确认。此前取消或输入结束不会安装软件、分配编号或创建节点。
-4. **集中执行**：按计划准备 Swap、依赖和二维码工具、Docker，再生成并校验节点配置、启动容器和自检。执行期间不再询问；可选二维码安装失败时跳过，核心准备失败时停止。
-5. **展示结果**：分别显示状态、VMess 链接、二维码和 Nginx 提示，不再触发安装。已有 Nginx / 宝塔入口会提示等待手工配置，完成后通过「测试连接」验证。
+```bash
+curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh | sudo bash -s -- init
+```
 
-全新服务器尚未安装 Python 时仍可先填写信息。高级设置显示预先生成的端口、路径和 UUID 默认值，回车即可采用；输入先做基础校验，工具就绪后再做完整校验，通过后才创建节点。
+上面的管道命令只初始化环境，不创建节点。若运行命令本身提示找不到 `curl`，需先通过系统包管理器安装它。
 
-选择入口后，会只读检查该域名在本机 HTTPS 入口的证书是否通过信任和域名校验，并显示共享 Caddy 实际使用的 `/data` 存储，或预期证书卷的存在状态。数据卷存在不代表其中一定有可用证书；入口未启动或工具缺失时提示无法确认，不读取私钥，也不扫描或导入旧版证书。已有 Nginx / 宝塔的证书仍由原站点管理。
+</details>
 
-证书无法验证时，还会检查受管 Caddy 最近的该域名签发日志，提示限流及日志给出的重试时间。历史限流不代表当前仍受限，已有可信证书或后续签发成功时不会据旧错误报告当前限流。检查只提供信息，仍由最终确认决定是否执行；它不触发手工申请证书，也不关闭 TLS 校验。
+### 4. 创建第一个节点
 
-「初始化环境」保留为独立入口，同样先检查和收集选择，汇总确认后集中执行，不创建节点。已有 Compose 版本过低或 Podman 冲突需自行处理，不自动替换已有组件。二维码可选，不安装也能使用客户端链接。
+进入主菜单后，直接选择 **「1) 新增节点」**，不用先初始化环境。
 
-也可以下载脚本后使用子命令：
+1. 选择「本机节点」或「中转节点」，输入方便识别的名称。
+2. 选择入口，填写域名。端口、UUID 和路径通常采用默认值即可。
+3. 如果是中转节点，导入远端 VMess 链接，或手动填写参数；核对解析出的地址、端口、路径、Host 和 SNI。
+4. 选择环境准备项目，检查最终汇总，再确认执行。
+5. 等待部署结束，复制 VMess 链接或扫描二维码导入客户端。
 
-| 子命令 | 作用 |
+输入框中的 `[内容]` 是默认值，直接回车即可使用；带有「0 返回」的选项可以取消。最终确认前不会安装软件或创建节点。
+
+首次安装没有 Python 时，仍可先填写信息；远端链接会提示暂时无法解析，环境准备完成后再校验并展示。
+
+**选择已有 Nginx / 宝塔时，还需完成下面的转发配置，节点才能从外部连接。**
+
+### 5. 再加一个中转节点
+
+在同一台服务器再次选择「新增节点 → 中转节点」，入口选择已有域名，再导入远端链接即可。
+
+| 设置 | 第一个节点 | 第二个节点 |
+| --- | --- | --- |
+| 域名、HTTPS 端口 | 同一域名，443 | 复用同一入口 |
+| 本地端口 | 例如 2333 | 例如 2334 |
+| WebSocket 路径 | 例如 `/one` | 例如 `/two` |
+| 出口 | 本机直出 | 远端中转 |
+
+本地端口和同域名下的路径不能重复。默认端口会避开已登记或检测到占用的端口；执行前也会再次检查。
+
+## 宝塔 / 已有 Nginx
+
+脚本不会修改你的站点或证书配置。按以下步骤接入：
+
+1. 在宝塔或 Nginx 中为域名配置 HTTPS 站点和有效证书。
+2. 新增节点时选择「已有 Nginx」入口。
+3. 把脚本输出的转发片段加入该站点监听 443 的 `server` 块。
+4. 检查并重载 Nginx，再运行「管理节点 → 测试连接」。
+
+片段示例，**路径和端口要使用脚本实际输出的值**：
+
+```nginx
+location = /example-path {
+    proxy_pass http://127.0.0.1:2334;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 300s;
+}
+```
+
+每个节点添加自己的路径片段，不需要把整站都反向代理到节点。复用域名新增节点时仍需添加新路径；删除节点后，对应片段也需自行移除。
+
+节点本地端口只监听 `127.0.0.1`，无需向公网开放。启用 SELinux 的机器还需确保 Nginx 有权限连接该端口；脚本不会关闭 SELinux 或修改已有 Nginx 的全局策略。
+
+## 日常管理
+
+再次运行脚本即可打开菜单：
+
+| 菜单 | 用途 |
 | --- | --- |
-| `init` | 初始化系统依赖和 Docker / Compose 环境 |
-| `node-add` | 新增本机或中转节点 |
-| `node-manage` | 选择节点，查看链接、修改、测试、查看日志、重启、删除或更新 |
-| `nodes` | 查看节点配置与容器状态 |
-| `node-update` | 选择并更新节点镜像 |
-| `node-delete` | 选择并删除节点 |
-| `ingress-update` | 更新共享 Caddy，失败时恢复原镜像 |
+| 1) 新增节点 | 创建直出或中转节点 |
+| 2) 管理节点 | 查看链接/二维码、修改、测试连接、查看日志、重启、删除或更新 |
+| 3) 所有节点状态 | 查看容器、实际镜像、程序版本和证书信息 |
+| 4) 更新指定节点 | 更新选中节点的 V2Fly 镜像 |
+| 5) 删除节点 | 选择一个节点并确认删除 |
+| 6) 初始化环境 | 单独准备依赖、Docker 或二维码工具，不创建节点 |
+| 7) 更新共享 Caddy | 更新所有 Caddy 节点共用的 HTTPS 入口 |
+| 0) 退出 | 结束本次操作 |
 
-例如：
+删除节点会保留 Docker、系统依赖、其他节点和证书卷。删除最后一个 Caddy 节点时，会停止共享入口，但仍保留证书卷。
 
-```bash
-bash v2fly-auto-setup.sh init
-bash v2fly-auto-setup.sh node-add
-```
+修改或更新失败时，脚本会尝试恢复变更前的配置和镜像；如果恢复失败，会提示备份位置。共享 Caddy 更新或配置重载可能导致已有连接重连。
 
-通过管道运行时，可以使用：
+**容器显示 running 只代表进程在运行。** 请再执行节点连接测试，并在客户端切换节点、查询出口 IP，确认实际线路符合预期。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/main/v2fly-auto-setup.sh | sudo bash -s -- init
-```
+## 常见问题
 
-不要使用 `sudo bash <(curl ...)`：sudo 可能关闭进程替换所需的文件描述符，导致找不到脚本。使用上面的管道形式，或先切换到 root。
+### 必须先安装 Docker 或初始化环境吗？
 
-## 环境初始化
+不必。直接新增节点即可，脚本先检查环境，在最终确认后准备缺失项目。已有 Compose 版本过低或 Podman 冲突时会提示自行处理，不自动替换这些组件。
 
-支持 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9、CentOS Stream 9；不支持 CentOS Linux、Stream 8 或 RHEL。初始化会检查系统、基础依赖和 Docker 服务。
+### 为什么提示创建 Swap？
 
-- 已有 Docker 时保留引擎。缺少 Compose 时下载固定版本 v2.24.7 的官方插件，并校验 SHA-256；该插件不会由系统包管理器自动更新。
-- EL9 新装 Docker 使用 Docker 官方 CentOS RPM 软件源。遇到 Podman 兼容命令或包冲突时停止，不自动卸载其他软件。
-- 核验 `curl`、`openssl`、`python3`、`ss`、`ip` 和 `ca-certificates`。二维码工具 `qrencode` 可选；缺失时仍可输出客户端链接。二维码安装策略在执行前选择，默认选项 1：安装，EL9 必要时允许添加 EPEL 9；也可选择仅使用现有源或跳过安装。安装计划在最终确认后执行。
-- 新增节点和环境初始化都会检查内存 / Swap，包括 Docker 和依赖已齐全的机器。内存不足 1 GiB 且无活动 Swap 时，在输入阶段询问是否计划创建 1 GiB Swap，默认不创建；拒绝则停止此次新增或初始化。实际创建仅在最终确认后执行。创建前检查 ext4 / XFS 和至少 2 GiB 可用磁盘，不覆盖已有 `/swapfile`，并备份 `/etc/fstab`。已有 Swap 保留。
+Swap 是磁盘上的交换空间，用来缓解内存不足。物理内存不足 1 GiB 且没有活动 Swap 时，脚本会询问是否创建 1 GiB Swap；拒绝则停止本次新增或初始化。已有 Swap 会保留。
 
-Caddy 入口需要 TCP 80/443。脚本可处理活动的 ufw / firewalld；不会启动未运行的 firewalld。已有 Nginx 模式不修改防火墙。云厂商安全组需自行放行。
+### 选了安装二维码，为什么先出现找不到 qrencode？
 
-SELinux 保持开启；脚本不修改已有 Nginx 的全局 SELinux 策略。宝塔或站点管理员需确保 Nginx 可以连接节点回环端口。
+在 CentOS Stream 9、Rocky 9、AlmaLinux 9 上，脚本先尝试现有软件源。选择策略 1 后，如果现有源找不到，会按需添加 EPEL 9（额外的软件仓库）再试。请看安装结束后的最终提示，不要只看第一次尝试的结果。
 
-## 宝塔面板 / 已有 Nginx
+二维码是可选功能。安装失败、选择不安装或终端太窄时，都可以复制 VMess 链接导入。以后可通过「初始化环境」补装；查看链接时不会临时安装工具。
 
-新增节点时选择「已有 Nginx」入口。脚本不会修改宝塔站点或证书配置。
+### 证书预检说无法确认，是证书丢了吗？
 
-1. 在宝塔为域名添加站点，申请并部署 SSL 证书。
-2. 将脚本输出的 `location` 片段加入该站点监听 443 的 `server` 块。例如：
+不一定。入口未启动、连接超时或工具缺失，都可能导致无法验证。预检会显示本机 HTTPS 验证结果和 Caddy 当前证书存储；数据卷存在也不代表里面一定有该域名的可用证书。
 
-   ```nginx
-   location = /example-path {
-       proxy_pass http://127.0.0.1:2334;
-       proxy_http_version 1.1;
-       proxy_set_header Upgrade $http_upgrade;
-       proxy_set_header Connection "upgrade";
-       proxy_set_header Host $host;
-       proxy_read_timeout 300s;
-   }
-   ```
+### 证书申请遇到 rateLimited / HTTP 429 怎么办？
 
-   路径和端口必须使用对应节点输出的值。每个节点添加自己的片段，不需要整站反向代理。
-3. 检查并重载 Nginx，然后运行「管理节点 → 测试连接」。容器启动成功不代表 Nginx 转发已经配置完成。
+先看提示中的允许重试时间，保留证书数据，不要反复删除证书卷重装。脚本会从受管 Caddy 的近期日志中查找所选域名的限流记录，并区分历史记录与尚未到达的重试时间。最终能否签发仍以证书服务的最新响应为准。
 
-复用同一个 Nginx 域名创建另一个节点后，仍需添加新路径。删除节点后，对应 Nginx 片段也需自行移除。
+### 服务器测试通过，客户端还是连不上？
 
-## 管理与失败恢复
+脚本主要检查本机 HTTPS 入口和代理出口。客户端到服务器之间的网络、云安全组，以及经过 CDN 的链路，还需要在客户端实际验证。
 
-「所有节点状态」显示节点容器、实际运行版本和镜像，并单独显示共享 Caddy 状态；按域名读取本机 HTTPS 入口的证书签发者与到期时间。证书尚未就绪时给出提示。
+## 使用 Cloudflare CDN
 
-节点链接和二维码通过「管理节点 → 链接/二维码」查看。二维码按终端宽度选择纠错等级。查看链接时不安装工具；缺少 `qrencode` 会提示通过「初始化环境」补装。CentOS Stream 9 / Rocky 9 / AlmaLinux 9 按预先选择的策略使用现有源或官方 EPEL 9 源。跳过、安装失败或窗口过窄时仍保留导入链接。客户端参数为 VMess、WebSocket、TLS、端口 443、alterId 0，域名、UUID 和路径使用节点输出。
+域名、路径和证书配置正确时，通常只需切换 DNS 记录的代理状态，无需修改节点配置：
 
-修改、重启、更新及删除只操作选中的节点容器。Caddy 是共享入口：入口路径发生变化时需要重载，现有 WebSocket 连接可能重连。
+| 状态 | 连接方式 |
+| --- | --- |
+| 灰云（仅 DNS） | 客户端直接连接服务器 |
+| 橙云（已代理） | 客户端通过 Cloudflare 连接服务器 |
 
-修改或更新前备份配置并记录原镜像 ID。应用或自检失败时尝试恢复原配置及原镜像，不依赖 `latest` 仍指向旧版本。恢复失败会保留备份并报告位置。临时连接测试只清理本次创建的容器；临时配置与备份按凭据保护。
+使用橙云时，保持 WebSockets 开启，SSL/TLS 模式选择「完全（严格）」，并确保 Cloudflare 和服务器两端的证书都覆盖节点域名。如果还需要切回灰云，服务器应使用客户端信任的证书；Cloudflare Origin CA 证书不适合客户端直接连接。
 
-共享 Caddy 通过主菜单「更新共享 Caddy」或 `ingress-update` 单独更新。更新前会提示所有 Caddy 节点可能短暂断连；更新失败时尝试恢复原镜像，恢复失败保留备份。已有 Nginx / 宝塔不由此操作更新。
+开启 CDN 后，请在客户端重新测试。服务器本机测试通过，不代表 CDN 路径也正常。
 
-「删除节点」选中并确认后，只删除目标节点的容器及配置，保留 Docker、依赖、其他节点和证书。最后一个 Caddy 节点删除后停止共享入口，证书卷仍保留。
+官方说明：[DNS 代理状态](https://developers.cloudflare.com/dns/proxy-status/) · [WebSockets](https://developers.cloudflare.com/network/websockets/) · [完全（严格）](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/full-strict/) · [Origin CA](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/)
 
-连接测试包含 WebSocket 握手和临时 V2Fly 客户端的代理请求。服务器测试不能替代客户端实际网络验证；导入 Shadowrocket 后应通过代理查询出口 IP，确认直出和中转线路符合预期。
+## 高级说明
 
-## Cloudflare CDN
+<details>
+<summary>环境安装与系统设置</summary>
 
-节点使用域名、443 和 WebSocket + TLS。域名、路径和证书设置正确时，通常只需切换 Cloudflare DNS 的代理状态（橙云 / 灰云），无需修改节点配置。橙云经过 Cloudflare，灰云直连源站；仅把 DNS 托管到 Cloudflare 并不等于开启代理。参见 [Cloudflare DNS 代理说明](https://developers.cloudflare.com/dns/proxy-status/)。
+- 核心依赖包括 curl、OpenSSL、Python 3、ss、ip 和系统 CA 证书。
+- 已有 Docker 引擎会保留。缺少 Compose 时，下载固定版本 v2.24.7 的官方插件并校验 SHA-256；该插件不会由系统包管理器自动更新。
+- EL9 新装 Docker 使用 Docker 官方 CentOS RPM 软件源；遇到 Podman 冲突时停止，不自动卸载其他软件。
+- 二维码默认策略为 1：安装，EL9 必要时允许添加 EPEL 9。也可选择仅现有源或不安装。
+- 创建 Swap 前会检查 ext4 / XFS 文件系统及至少 2 GiB 可用磁盘，不覆盖已有 `/swapfile`，并备份 `/etc/fstab`。
+- Caddy 模式可为已启用的 ufw / firewalld 放行 TCP 80/443，不会启动未运行的 firewalld；Nginx 模式不修改防火墙。云安全组需自行设置。
 
-使用代理时保持 WebSockets 开启，并为源站配置有效证书，SSL/TLS 使用“完全（严格）”。Cloudflare 的边缘证书也需覆盖节点域名。如果需要随时切回灰云，源站应使用客户端信任的证书（例如 Caddy 申请的公开 CA 证书）；只受 Cloudflare 信任的 [Origin CA 证书](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/)不适合直接给客户端使用。参见 [WebSockets](https://developers.cloudflare.com/network/websockets/) 和 [完全（严格）模式](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/full-strict/)。
+</details>
 
-边缘检测属于诊断功能，不是启用 CDN 的前提。本脚本当前连接测试主要检查本机 HTTPS 入口及代理出口，不证明 Cloudflare 路径可用；启用代理后仍应在客户端测试。源站正常而客户端失败时，检查 Cloudflare 的证书、WAF 与 WebSocket 设置。
+<details>
+<summary>命令行子命令</summary>
 
-## 文件位置
+下载脚本后，使用 `bash v2fly-auto-setup.sh <子命令>`：
+
+| 子命令 | 用途 |
+| --- | --- |
+| `init` | 初始化环境 |
+| `node-add` | 新增节点 |
+| `node-manage` | 管理节点 |
+| `nodes` | 查看状态 |
+| `node-update` | 更新节点镜像 |
+| `node-delete` | 删除节点 |
+| `ingress-update` | 更新共享 Caddy |
+
+这些命令仍按需交互，不是无人值守部署接口。
+
+</details>
+
+<details>
+<summary>配置文件与 Docker 资源位置</summary>
+
+部署目录固定为 `/root/v2fly-stack`：
 
 ```text
-/root/v2fly-stack/nodes/.id-sequence        节点编号记录
-/root/v2fly-stack/nodes/<id>/metadata.json  节点参数
-/root/v2fly-stack/nodes/<id>/config.json    V2Fly 配置
-/root/v2fly-stack/nodes/<id>/compose.yaml   节点独立容器定义
-/root/v2fly-stack/ingress/Caddyfile         共享 Caddy 入口配置
-/root/v2fly-stack/ingress/metadata.json     共享入口镜像记录（含回退镜像）
-/root/v2fly-stack/ingress.yaml              共享入口容器定义
+/root/v2fly-stack/
+├── nodes/
+│   ├── .id-sequence          # 节点编号记录，删除节点后不复用编号
+│   └── <编号>/
+│       ├── metadata.json    # 节点信息
+│       ├── config.json      # V2Fly 配置
+│       └── compose.yaml     # 节点容器定义
+├── ingress/
+│   ├── Caddyfile             # 共享入口配置
+│   └── metadata.json        # 共享入口镜像记录
+└── ingress.yaml             # 共享入口容器定义
 ```
 
-节点配置通过管理菜单修改。不要将真实 UUID、配置备份或证书提交到仓库。
+| 资源 | 名称 |
+| --- | --- |
+| 节点容器 / Compose 项目 | `v2fly-node-<编号>` |
+| 节点 Compose 服务 | `v2fly` |
+| 容器内配置文件 | `/etc/v2fly/config.json` |
+| 共享 Caddy 容器 / 项目 | `v2fly-ingress` |
+| 共享入口网络 | `v2fly-ingress_default` |
+| Caddy 证书数据卷 | `v2fly-ingress_node_caddy_data` |
 
-Docker 节点容器及 Compose 项目统一命名为 `v2fly-node-<编号>`，节点服务名为 `v2fly`，容器内配置路径为 `/etc/v2fly/config.json`。共享入口为 `v2fly-ingress`，网络为 `v2fly-ingress_default`，证书卷为 `v2fly-ingress_node_caddy_data`。
+优先通过管理菜单修改节点。UUID 和 VMess 链接包含连接凭据，请勿公开，也不要将真实配置、备份或证书提交到仓库。
 
-本次资源命名调整仅面向重新创建的节点，不迁移或接管原名称下的节点、容器、网络和证书卷。重新测试前需自行清理旧测试部署；新证书卷不会自动复用原卷中的证书。
+</details>
 
-## 本地验证
+<details>
+<summary>开发与本地验证</summary>
 
 ```bash
 bash -n v2fly-auto-setup.sh
@@ -180,4 +287,6 @@ bash tests/qr-install.sh
 bash tests/workflow.sh
 ```
 
-测试需要 Bash 和 Python 3，使用临时目录和模拟命令，不下载依赖、不操作真实 Docker 或系统配置。模拟测试不能代替支持系统上的真实部署验证。
+测试需要 Bash 和 Python 3，使用临时目录和模拟命令，不下载依赖、不操作真实 Docker 或系统配置。模拟测试不能代替各支持系统上的真实部署验证。
+
+</details>
