@@ -26,6 +26,13 @@ assert len(b['outbounds'])==1 and b['outbounds'][0]['protocol']=='vmess'
 assert b['outbounds'][0]['streamSettings']['tlsSettings']['allowInsecure'] is False
 for p in (r/'nodes').glob('*/*'):assert p.stat().st_mode&0o777==0o600
 assert '127.0.0.1:2334:2333' in (r/'nodes/1/compose.yaml').read_text()
+for node_id in (1, 2):
+    compose = (r/f'nodes/{node_id}/compose.yaml').read_text()
+    assert f'name: v2fly-node-{node_id}\n' in compose
+    assert 'services:\n  v2fly:\n' in compose
+    assert f'container_name: v2fly-node-{node_id}\n' in compose
+    assert 'command: run -c /etc/v2fly/config.json\n' in compose
+    assert 'target: /etc/v2fly/config.json\n' in compose
 PY
 echo 'PASS independent-direct-relay-and-permissions'
 if node_python create 4 1.example.com nginx direct 2334 /new "$U" v2fly/v2fly-core:latest; then exit 1; fi
@@ -65,12 +72,12 @@ STACK_DIR="$ROOT/caddy"; ENV_FILE="$STACK_DIR/.env"; COMPOSE_FILE="$STACK_DIR/co
 node_python create 1 1.example.com caddy direct 2334 /1 "$U" v2fly/v2fly-core:latest
 node_python create 2 1.example.com caddy relay 2335 /2 "$U" v2fly/v2fly-core:latest manual 2.example.com 443 "$U" /remote
 node_python ingress
-[[ $(cat "$STACK_DIR/ingress/Caddyfile") == *'reverse_proxy v2ray-node-2:2333'* ]] || exit 1
+[[ $(cat "$STACK_DIR/ingress/Caddyfile") == *'reverse_proxy v2fly-node-2:2333'* ]] || exit 1
 [[ $(cat "$STACK_DIR/ingress.yaml") == *'./ingress:/managed:ro,Z'* ]] || exit 1
 printf 'DOMAIN=old.example.com\nWS_PATH=/old\nFRONT=caddy\n' > "$ENV_FILE"
 printf 'original compose\n' > "$COMPOSE_FILE"
 node_python ingress
-[[ $(cat "$STACK_DIR/ingress/Caddyfile") != *'reverse_proxy v2ray:2333'* ]]
+[[ $(cat "$STACK_DIR/ingress/Caddyfile") == *'reverse_proxy v2fly-node-2:2333'* ]]
 [[ $(cat "$COMPOSE_FILE") == 'original compose' ]]
 echo 'PASS ignores-legacy-env-and-compose'
 # 效果模拟：只能重建选中节点并连接共享网络，Caddy 改动仅 reload。
@@ -78,14 +85,14 @@ LOG="$ROOT/docker.log"
 docker(){
   printf '%s\n' "$*" >> "$LOG"
   case "$*" in
-    *com.docker.compose.project*) echo v2ray-ingress ;;
+    *com.docker.compose.project*) echo v2fly-ingress ;;
     *Config.Cmd*) echo '/managed/Caddyfile' ;;
     *NetworkSettings.Networks*) echo '{}' ;;
   esac
 }
 NODE_ID=2
 node_ingress_apply
-[[ $(cat "$LOG") == *'network connect v2ray-ingress_default v2ray-node-2'* ]] || exit 1
+[[ $(cat "$LOG") == *'network connect v2fly-ingress_default v2fly-node-2'* ]] || exit 1
 [[ $(cat "$LOG") != *'caddy reload --config /managed/Caddyfile'* ]] || exit 1
 node_ingress_apply yes
 [[ $(cat "$LOG") == *'caddy reload --config /managed/Caddyfile'* ]] || exit 1
@@ -102,7 +109,7 @@ if node_apply "$backup" "$OLD" yes; then exit 1; fi
 [[ $(node_get image) == "$OLD" ]] || exit 1
 [[ $(node_get outbound) == relay ]] || exit 1
 [[ $(cat "$STACK_DIR/nodes/2/compose.yaml") == *"$OLD"* ]] || exit 1
-[[ $(cat "$LOG") == *'node=2 up -d --no-deps --force-recreate --pull never v2ray'* ]] || exit 1
+[[ $(cat "$LOG") == *'node=2 up -d --no-deps --force-recreate --pull never v2fly'* ]] || exit 1
 echo 'PASS rollback-original-image-and-target-scope'
 # 交互默认值：修改中转节点回车必须保留出口/远端/镜像；不执行真实 effects。
 (
@@ -139,7 +146,7 @@ echo 'PASS rollback-original-image-and-target-scope'
   node_python create 1 1.example.com caddy direct 2334 /1 "$U" v2fly/v2fly-core:latest
   node_python ingress
   rm "$STACK_DIR/nodes/1/metadata.json"
-  docker(){ printf '%s\n' "$*" >> "$ROOT/1.log"; if [[ $* == *com.docker.compose.project* ]]; then echo v2ray-ingress; fi; }
+  docker(){ printf '%s\n' "$*" >> "$ROOT/1.log"; if [[ $* == *com.docker.compose.project* ]]; then echo v2fly-ingress; fi; }
   node_ingress_apply
   [[ ! -f $STACK_DIR/ingress.yaml ]] || exit 1
   [[ $(cat "$ROOT/1.log") == *'down'* ]] || exit 1
@@ -149,7 +156,7 @@ echo 'PASS rollback-original-image-and-target-scope'
 # 无标签同名容器不能当成不存在。
 (
  docker(){ return 0; }
- if node_owner v2ray-node-1 v2ray-node-1; then exit 1; fi
+ if node_owner v2fly-node-1 v2fly-node-1; then exit 1; fi
  echo 'PASS unlabeled-container-ownership'
 )
 
@@ -350,8 +357,8 @@ INPUT
   printf '%s\n' "$*" >> "$ROOT/shared-recovery.log"
   case "$*" in
    *'{{.Image}}'*) echo "$IMMUTABLE" ;;
-   *com.docker.compose.project*) echo v2ray-ingress ;;
-   *NetworkSettings.Networks*) echo '{"v2ray-ingress_default":{}}' ;;
+   *com.docker.compose.project*) echo v2fly-ingress ;;
+   *NetworkSettings.Networks*) echo '{"v2fly-ingress_default":{}}' ;;
    'ps -q'*) return 0 ;;
   esac
  }
@@ -387,5 +394,5 @@ kill -TERM "$$"
 SIGNAL
 [[ $signal_status == 143 ]] || exit 1
 [[ -f $ROOT/signal/nodes/1/metadata.json ]] || exit 1
-[[ $(cat "$ROOT/signal.log") == *'up -d --no-deps --force-recreate --pull never v2ray'* ]] || exit 1
+[[ $(cat "$ROOT/signal.log") == *'up -d --no-deps --force-recreate --pull never v2fly'* ]] || exit 1
 printf 'PASS signal-recovers-selected-node\n'

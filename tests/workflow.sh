@@ -6,14 +6,14 @@ SCRIPT="$PWD/v2fly-auto-setup.sh"
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 export SCRIPT ROOT
-for test in port-race same-domain qr-default ready cancel eof type-return invalid-fields occupied-port duplicate-path mixed-front no-python no-python-menu invalid-link remote-invalid no-python-invalid-link missing-core core-failure recheck-failure swap-accept swap-refuse swap-failure qr-allow qr-native qr-skip qr-failure edit-relay nginx-result init-ready init-cancel init-missing; do
+for test in import-link bootstrap-import port-race same-domain qr-default ready cancel eof type-return invalid-fields occupied-port duplicate-path mixed-front no-python no-python-menu invalid-link remote-invalid no-python-invalid-link missing-core core-failure recheck-failure swap-accept swap-refuse swap-failure qr-allow qr-native qr-skip qr-failure edit-relay nginx-result init-ready init-cancel init-missing; do
  status=0
  bash -s -- "$test" <<'BASH' || status=$?
 set -euo pipefail
 source "$SCRIPT"
 TEST=$1; STACK_DIR="$ROOT/$TEST/stack"; LOG="$ROOT/$TEST.events"; : > "$LOG"
 IN=0; HAVE_PY=yes; HAVE_CORE=yes; HAVE_DOCKER=yes; HAVE_QR=yes; EPEL=no
-case "$TEST" in no-python|no-python-menu|no-python-invalid-link|missing-core|core-failure|recheck-failure|init-missing) HAVE_PY=no; HAVE_CORE=no; HAVE_DOCKER=no ;; esac
+case "$TEST" in bootstrap-import|no-python|no-python-menu|no-python-invalid-link|missing-core|core-failure|recheck-failure|init-missing) HAVE_PY=no; HAVE_CORE=no; HAVE_DOCKER=no ;; esac
 case "$TEST" in qr-*|init-missing) HAVE_QR=no ;; esac
 U=11111111-2222-4333-8444-555555555555
 OLD=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -142,6 +142,8 @@ elif [[ $TEST == occupied-port ]]; then
  printf '1\n名称\n2\none.example.com\ny\n2999\n2334\n/valid\n%s\nlatest\ny\n' "$U" > "$INPUT"
 elif [[ $TEST == remote-invalid ]]; then
  printf '2\n名称\n2\none.example.com\nn\n2\nbad domain\njp.example.com\n65536\n443\nauto\n%s\nauto\n/remote\n\n\ny\n' "$U" > "$INPUT"
+elif [[ $TEST == import-link || $TEST == bootstrap-import ]]; then
+ printf '2\n名称\n2\none.example.com\nn\n1\n%s\ny\n' "$LINK" > "$INPUT"
 elif [[ $TEST == invalid-link || $TEST == no-python-invalid-link ]]; then
  printf '2\n名称\n2\none.example.com\nn\n1\nvmess://bad\n' > "$INPUT"
  if [[ $TEST == invalid-link ]]; then printf '%s\ny\n' "$LINK" >> "$INPUT"; else printf 'y\n' >> "$INPUT"; fi
@@ -166,8 +168,26 @@ elif [[ $TEST == init-* ]]; then
  cmd_init < "$INPUT" > "$ROOT/$TEST.out" 2> "$ROOT/$TEST.err" || exit 1
 elif [[ $TEST == port-race || $TEST == core-failure || $TEST == recheck-failure || $TEST == swap-failure || $TEST == no-python-invalid-link ]]; then
  if cmd_node_add < "$INPUT" > "$ROOT/$TEST.out" 2> "$ROOT/$TEST.err"; then exit 1; fi
+elif [[ $TEST == import-link || $TEST == invalid-link || $TEST == bootstrap-import ]]; then
+ cmd_node_add < "$INPUT" > "$ROOT/$TEST.out" 2>&1 || exit 1
 else
  cmd_node_add "$(if [[ $TEST == edit-relay ]]; then echo yes; else echo no; fi)" < "$INPUT" > "$ROOT/$TEST.out" 2> "$ROOT/$TEST.err" || exit 1
+fi
+if [[ $TEST == import-link || $TEST == invalid-link || $TEST == bootstrap-import ]]; then
+ python3 - "$ROOT/$TEST.out" "$TEST" "$U" <<'PY'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+summary = text.index('远端节点配置：')
+planning = text.index('7 / 10 环境准备计划')
+if sys.argv[2] == 'bootstrap-import':
+    assert text.index('暂时无法解析远端链接') < planning < summary
+else:
+    assert summary < planning
+for expected in ('地址：jp.example.com', '端口：443', 'UUID：' + sys.argv[3],
+                 '传输：WebSocket', 'TLS：开启（严格验证）', 'WebSocket 路径：/remote',
+                 'Host：jp.example.com', 'SNI：jp.example.com'):
+    assert expected in text
+PY
 fi
 assert not_contains FORBIDDEN
 case "$TEST" in
@@ -217,7 +237,7 @@ if [[ $TEST == same-domain ]]; then
  assert cmp "$ROOT/$TEST.first" "$STACK_DIR/nodes/1/metadata.json"
  assert test "$(node_get port)" != 2333
  assert test "$(node_get path)" != /first
- for route in v2ray-node-1:2333 v2ray-node-2:2333; do
+ for route in v2fly-node-1:2333 v2fly-node-2:2333; do
   [[ $(cat "$STACK_DIR/ingress/Caddyfile") == *"$route"* ]] || exit 1
  done
 fi
@@ -277,7 +297,7 @@ source "$SCRIPT"
 STACK_DIR="$ROOT/certificate-check"
 LOG="$ROOT/certificate-read.events"
 : > "$LOG"
-CERT_STATUS=0; CERT_CODE=502; OWNER=v2ray-ingress; PRESENT=yes; VOLUME=yes
+CERT_STATUS=0; CERT_CODE=502; OWNER=v2fly-ingress; PRESENT=yes; VOLUME=yes
 RAW=''; HAVE_PY=yes
 command(){
  if [[ ${1:-} == -v ]]; then
@@ -317,7 +337,7 @@ result=$(check caddy)
 echo PASS certificate-untrusted
 CERT_STATUS=7; PRESENT=no; VOLUME=yes
 result=$(check caddy)
-[[ $result == *'预期证书卷 v2ray-ingress_node_caddy_data 已存在'* && $result == *'无法判断磁盘是否已有证书'* ]]
+[[ $result == *'预期证书卷 v2fly-ingress_node_caddy_data 已存在'* && $result == *'无法判断磁盘是否已有证书'* ]]
 echo PASS certificate-offline-volume-exists
 VOLUME=no
 result=$(check caddy)
@@ -327,7 +347,7 @@ PRESENT=yes; OWNER=foreign
 result=$(check caddy)
 [[ $result == *'不是本项目资源'* && $result != *'custom_certificate_volume'* ]]
 echo PASS certificate-foreign-container
-OWNER=v2ray-ingress
+OWNER=v2fly-ingress
 : > "$LOG"
 result=$(check nginx)
 [[ $result == *'由现有 Nginx / 宝塔管理'* && $(cat "$LOG") != *docker* ]]

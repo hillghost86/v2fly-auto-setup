@@ -22,7 +22,7 @@ docker(){
  printf '%s\n' "$*" >> "$LOG"
  if [[ $1 == inspect && ( $TEST == missing || $TEST == status-missing ) ]]; then return 1; fi
  case "$*" in
-  *com.docker.compose.project*) if [[ $TEST == foreign ]]; then echo unrelated; elif [[ ${*: -1} == v2ray-ingress ]]; then echo v2ray-ingress; else echo "${*: -1}"; fi ;;
+  *com.docker.compose.project*) if [[ $TEST == foreign ]]; then echo unrelated; elif [[ ${*: -1} == v2fly-ingress ]]; then echo v2fly-ingress; else echo "${*: -1}"; fi ;;
   *'{{.Image}}'*) echo "$OLD" ;;
   *'{{.State.Status}}'*) echo running ;;
   'exec '*version) echo 'mock version 1' ;;
@@ -94,7 +94,8 @@ if [[ $TEST == status || $TEST == status-missing || $TEST == status-certificate-
  fi
  [[ $(rg -c 'timeout 8 openssl s_client.*-servername one.example.com' "$LOG") == 1 ]]
  if [[ $TEST == status ]]; then
-  [[ $(cat "$STACK_DIR/status") == *'程序版本：mock version 1'* && $(cat "$STACK_DIR/status") == *issuer=mock* && $(cat "$STACK_DIR/status") == *v2ray-ingress* ]]
+  [[ $(cat "$LOG") == *'exec v2fly-node-1 v2ray version'* && $(cat "$LOG") == *'exec v2fly-ingress caddy version'* ]]
+  [[ $(cat "$STACK_DIR/status") == *'程序版本：mock version 1'* && $(cat "$STACK_DIR/status") == *issuer=mock* && $(cat "$STACK_DIR/status") == *v2fly-ingress* ]]
  elif [[ $TEST == status-missing ]]; then [[ $(cat "$STACK_DIR/status") == *'容器不存在或无法读取'* ]]
  else [[ $(cat "$STACK_DIR/status") == *'证书读取失败'* ]]; fi
  exit 0

@@ -162,6 +162,10 @@ SELinux 保持开启；脚本不修改已有 Nginx 的全局 SELinux 策略。�
 
 节点配置通过管理菜单修改。不要将真实 UUID、配置备份或证书提交到仓库。
 
+Docker 节点容器及 Compose 项目统一命名为 `v2fly-node-<编号>`，节点服务名为 `v2fly`，容器内配置路径为 `/etc/v2fly/config.json`。共享入口为 `v2fly-ingress`，网络为 `v2fly-ingress_default`，证书卷为 `v2fly-ingress_node_caddy_data`。
+
+本次资源命名调整仅面向重新创建的节点，不迁移或接管原名称下的节点、容器、网络和证书卷。重新测试前需自行清理旧测试部署；新证书卷不会自动复用原卷中的证书。
+
 ## 本地验证
 
 ```bash

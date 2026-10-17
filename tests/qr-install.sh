@@ -44,7 +44,17 @@ case "$TEST" in
  el9-epel|el9-epel-failure|el9-package-failure) policy=allow ;;
 esac
 if [[ $TEST == el9-* ]]; then OS_FAMILY=el9; else OS_FAMILY=debian; fi
-if [[ $TEST != installed && $TEST != plain ]]; then install_optional_qr "$policy" || exit 1; fi
+INSTALL_OUTPUT="$ROOT/$TEST.install-output"
+: > "$INSTALL_OUTPUT"
+if [[ $TEST != plain ]]; then install_optional_qr "$policy" > "$INSTALL_OUTPUT" || exit 1; fi
+case "$TEST" in
+ installed|debian|el9-native|el9-epel)
+  [[ $(cat "$INSTALL_OUTPUT") == *'qrencode（二维码）已就绪'* && $(cat "$INSTALL_OUTPUT") != *'跳过二维码'* && $(cat "$INSTALL_OUTPUT") != *'未就绪'* ]] || exit 1 ;;
+ debian-failure|el9-native-skip|el9-epel-failure|el9-package-failure)
+  [[ $(cat "$INSTALL_OUTPUT") == *'二维码工具未就绪，本次仅提供客户端链接。'* && $(cat "$INSTALL_OUTPUT") != *'已就绪'* ]] || exit 1 ;;
+ skip|missing-show|skip-pure|show-no-os|show-no-swap)
+  [[ $(cat "$INSTALL_OUTPUT") == *'按计划不安装二维码工具'* ]] || exit 1 ;;
+esac
 node_show > "$ROOT/$TEST.output" </dev/null || exit 1
 [[ $(cat "$ROOT/$TEST.output") == *vmess://* && $(cat "$LOG") != *FORBIDDEN* && $(cat "$LOG") != *memory-check* ]] || exit 1
 case "$TEST" in

@@ -393,8 +393,6 @@ install_deps() {
   else
     red "✗ ca-certificates 未安装"; missing=yes
   fi
-  if command -v qrencode >/dev/null; then grn "✓ qrencode（二维码）";
-  else ylw "⚠ qrencode 不可用，跳过二维码；客户端链接仍可使用。"; fi
   [[ $missing == no ]] || die "核心依赖核验失败，停止安装；请修复上面标记的项目后重试"
   grn "✓ 核心依赖已就绪"
 }
@@ -491,9 +489,9 @@ caddy_rate_limit_hint() {
   local domain=$1 trusted=${2:-no} owner
   [[ $trusted != yes ]] || return 0
   command -v docker >/dev/null && command -v timeout >/dev/null && command -v python3 >/dev/null || return 0
-  owner=$(timeout 5 docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' v2ray-ingress 2>/dev/null) || return 0
-  [[ $owner == v2ray-ingress ]] || return 0
-  timeout 5 docker logs --since 24h --tail 200 v2ray-ingress 2>&1 | node_python certificate-limit "$domain" 3<&0 || true
+  owner=$(timeout 5 docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' v2fly-ingress 2>/dev/null) || return 0
+  [[ $owner == v2fly-ingress ]] || return 0
+  timeout 5 docker logs --since 24h --tail 200 v2fly-ingress 2>&1 | node_python certificate-limit "$domain" 3<&0 || true
 }
 
 node_certificate_preflight() {
@@ -502,14 +500,14 @@ node_certificate_preflight() {
   if [[ $front == nginx ]]; then
     echo '证书由现有 Nginx / 宝塔管理；不检查 Caddy 数据卷。'
   elif command -v docker >/dev/null && command -v timeout >/dev/null; then
-    if owner=$(timeout 5 docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' v2ray-ingress 2>/dev/null); then
-      if [[ $owner == v2ray-ingress ]]; then
-        mount=$(timeout 5 docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}} {{.Name}} {{.Source}}{{end}}{{end}}' v2ray-ingress 2>/dev/null) || mount=''
+    if owner=$(timeout 5 docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' v2fly-ingress 2>/dev/null); then
+      if [[ $owner == v2fly-ingress ]]; then
+        mount=$(timeout 5 docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}} {{.Name}} {{.Source}}{{end}}{{end}}' v2fly-ingress 2>/dev/null) || mount=''
         if [[ -n $mount ]]; then printf '共享 Caddy 当前 /data 挂载：%s\n' "$mount";
         else ylw '未读取到共享 Caddy 的 /data 挂载，证书存储状态未知。'; fi
       else ylw '同名 Caddy 容器不是本项目资源，不读取其证书存储或日志。'; fi
     else
-      volume=v2ray-ingress_node_caddy_data
+      volume=v2fly-ingress_node_caddy_data
       if timeout 5 docker volume inspect "$volume" >/dev/null 2>&1; then
         echo "共享 Caddy 当前没有可读取的容器；预期证书卷 $volume 已存在。"
       else echo "共享 Caddy 当前没有可读取的容器；预期证书卷 $volume 未确认存在，启动时可能需要申请证书。"; fi
@@ -559,7 +557,7 @@ ws_diagnose() {
   esac
   red "HTTPS / WebSocket 自检失败：$detail"
   caddy_rate_limit_hint "$DOMAIN" "$(if [[ $status == 0 ]]; then echo yes; else echo no; fi)"
-  ylw '可在服务器查看入口日志：docker logs --tail 80 v2ray-ingress（恢复后日志可能已变化）。'
+  ylw '可在服务器查看入口日志：docker logs --tail 80 v2fly-ingress（恢复后日志可能已变化）。'
 }
 
 e2e_ok() {
@@ -589,8 +587,8 @@ EOF
   E2E_CID_FILE="$dir/container.cid"
   E2E_CID_FILES+=("$E2E_CID_FILE")
   docker run -d --cidfile "$E2E_CID_FILE" --user 0:0 "${run_opts[@]}" -p 127.0.0.1::10808 \
-    -v "$dir/config.json:/etc/v2ray/config.json:ro,Z" \
-    "$E2E_IMAGE" run -c /etc/v2ray/config.json >/dev/null 2>&1 || return 1
+    -v "$dir/config.json:/etc/v2fly/config.json:ro,Z" \
+    "$E2E_IMAGE" run -c /etc/v2fly/config.json >/dev/null 2>&1 || return 1
   sleep 3
   hostport=$(docker port "$(cat "$E2E_CID_FILE")" 10808/tcp 2>/dev/null | head -1 | sed 's/.*://')
   if [[ -n $hostport ]]; then
@@ -766,18 +764,18 @@ def render_node(node):
     write(folder / 'config.json', config)
     # Compose 内嵌配置避免宿主文件挂载造成 SELinux 标签冲突。
     embedded = ''.join('      ' + line + '\n' for line in config.splitlines())
-    compose = f'''name: v2ray-node-{node['id']}
+    compose = f'''name: v2fly-node-{node['id']}
 services:
-  v2ray:
+  v2fly:
     image: {json.dumps(node['image'])}
-    container_name: v2ray-node-{node['id']}
+    container_name: v2fly-node-{node['id']}
     restart: unless-stopped
-    command: run -c /etc/v2ray/config.json
+    command: run -c /etc/v2fly/config.json
     ports:
       - "127.0.0.1:{node['port']}:2333"
     configs:
       - source: node_config
-        target: /etc/v2ray/config.json
+        target: /etc/v2fly/config.json
 configs:
   node_config:
     content: |
@@ -809,7 +807,7 @@ def render_ingress():
     domains = {}
     for node in allnodes():
         if node['front'] == 'caddy':
-            domains.setdefault(node['domain'], []).append((node['path'], f"v2ray-node-{node['id']}:2333"))
+            domains.setdefault(node['domain'], []).append((node['path'], f"v2fly-node-{node['id']}:2333"))
     if not domains:
         return
     sections = []
@@ -820,11 +818,11 @@ def render_ingress():
         lines.extend(['  handle {', '    respond "It works!" 200', '  }', '}'])
         sections.append('\n'.join(lines))
     write(root / 'ingress' / 'Caddyfile', '\n'.join(sections) + '\n')
-    write(root / 'ingress.yaml', f'''name: v2ray-ingress
+    write(root / 'ingress.yaml', f'''name: v2fly-ingress
 services:
   caddy:
     image: {json.dumps(ingress_image())}
-    container_name: v2ray-ingress
+    container_name: v2fly-ingress
     restart: unless-stopped
     command: caddy run --config /managed/Caddyfile --adapter caddyfile
     ports:
@@ -898,11 +896,21 @@ def create_node(*args):
     render_node(node)
 
 
+def print_remote_summary(remote):
+    print('远端节点配置：')
+    print(f"  地址：{remote['domain']}")
+    print(f"  端口：{remote['port']}")
+    print(f"  UUID：{remote['uuid']}")
+    print('  协议：VMess；传输：WebSocket；TLS：开启（严格验证）')
+    print(f"  WebSocket 路径：{remote['path']}")
+    print(f"  Host：{remote['host']}")
+    print(f"  SNI：{remote['sni']}")
+
+
 def validate_create(*args):
     node = build_node(*args)
     if node['outbound'] == 'relay':
-        remote = node['remote']
-        print(f"远端：{remote['domain']}:{remote['port']}{remote['path']}；Host={remote['host']}；SNI={remote['sni']}")
+        print_remote_summary(node['remote'])
 
 
 def resolve_defaults(port, path, user_id):
@@ -1048,6 +1056,7 @@ HANDLERS = {
     'validate-create': validate_create,
     'defaults': print_defaults,
     'validate-link': validate_link,
+    'preview-link': lambda link: print_remote_summary(parse_remote_link(link)),
     'validate-port': validate_port,
     'validate-path': validate_path,
     'get': get_node,
@@ -1077,10 +1086,10 @@ PY
 node_compose() { docker compose --project-directory "$STACK_DIR/nodes/$NODE_ID" "$@"; }
 node_get() { node_python get "$NODE_ID" "$1"; }
 node_ingress_apply() {
-  local force=${1:-no} name=v2ray-ingress network=v2ray-ingress_default ids previous='' changed=yes
+  local force=${1:-no} name=v2fly-ingress network=v2fly-ingress_default ids previous='' changed=yes
   ids=$(node_python ids) || return 1
   if [[ -z $ids && -f $STACK_DIR/ingress.yaml ]]; then
-    node_owner v2ray-ingress v2ray-ingress || return 1
+    node_owner v2fly-ingress v2fly-ingress || return 1
     docker compose --project-directory "$STACK_DIR" -f "$STACK_DIR/ingress.yaml" down || return 1
     rm -f "$STACK_DIR/ingress.yaml" "$STACK_DIR/ingress/Caddyfile"
     return 0
@@ -1093,7 +1102,7 @@ node_ingress_apply() {
     node_python ingress-image "$NODE_INGRESS_IMAGE" || return 1
     node_python ingress || return 1
   fi
-  node_owner "$name" v2ray-ingress || return 1
+  node_owner "$name" v2fly-ingress || return 1
   if ! container_running "$name"; then
     docker compose --project-directory "$STACK_DIR" -f "$STACK_DIR/ingress.yaml" up -d caddy || return 1
   fi
@@ -1101,8 +1110,8 @@ node_ingress_apply() {
   while IFS= read -r id; do
     [[ -n $id ]] || continue
     if [[ $(node_python get "$id" front) == caddy ]]; then
-      if ! docker inspect -f '{{json .NetworkSettings.Networks}}' "v2ray-node-$id" | grep -q "\"$network\""; then
-        docker network connect "$network" "v2ray-node-$id" || return 1
+      if ! docker inspect -f '{{json .NetworkSettings.Networks}}' "v2fly-node-$id" | grep -q "\"$network\""; then
+        docker network connect "$network" "v2fly-node-$id" || return 1
       fi
     fi
   done < <(node_python ids)
@@ -1167,7 +1176,7 @@ node_select() {
   done
   NODE_ID=${ids[choice-1]}
   node_get id >/dev/null || return 1
-  node_owner "v2ray-node-$NODE_ID" "v2ray-node-$NODE_ID" || return 1
+  node_owner "v2fly-node-$NODE_ID" "v2fly-node-$NODE_ID" || return 1
 }
 
 node_choice() {
@@ -1210,7 +1219,7 @@ node_ingress_select() {
       ylw '已有节点使用另一种 HTTPS 管理方式，请重新选择兼容的入口。' >&2
       continue
     fi
-    if [[ $front == caddy && $busy == yes ]] && ! container_running v2ray-ingress; then
+    if [[ $front == caddy && $busy == yes ]] && ! container_running v2fly-ingress; then
       ylw '80/443 已被占用，请选择已有 Nginx 或复用已登记入口。'; continue
     fi
     workflow_step '入口域名'
@@ -1223,13 +1232,19 @@ node_ingress_select() {
 
 install_optional_qr() {
   local policy=$1
-  [[ $policy == allow || $policy == native ]] || return 0
-  command -v qrencode >/dev/null && return 0
+  if command -v qrencode >/dev/null; then grn '✓ qrencode（二维码）已就绪'; return 0; fi
+  case $policy in
+    skip) ylw '按计划不安装二维码工具；客户端链接仍可使用。'; return 0 ;;
+    allow|native) step '按计划安装二维码工具' ;;
+    *) ylw '二维码工具当前不可用；客户端链接仍可使用。'; return 0 ;;
+  esac
   if [[ $OS_FAMILY == el9 ]]; then
     install_qrencode_el9 "$policy" || ylw '二维码工具安装失败，继续使用链接。'
   elif ! apt-get update -qq || ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; then
     ylw '二维码工具安装失败，继续使用链接。'
   fi
+  if command -v qrencode >/dev/null; then grn '✓ qrencode（二维码）已就绪';
+  else ylw '二维码工具未就绪，本次仅提供客户端链接。'; fi
   return 0
 }
 
@@ -1302,7 +1317,7 @@ node_ready() {
 
 node_apply() {
   local backup=$1 oldimage=$2 existed=$3
-  if node_compose config -q && node_compose run --rm --no-deps --pull never v2ray test -c /etc/v2ray/config.json && node_compose up -d --no-deps --force-recreate --pull never v2ray; then
+  if node_compose config -q && node_compose run --rm --no-deps --pull never v2fly test -c /etc/v2fly/config.json && node_compose up -d --no-deps --force-recreate --pull never v2fly; then
     if { [[ $(node_get front) != caddy ]] || node_ingress_apply; } && node_ready; then return 0; fi
   fi
   red '节点变更失败，正在恢复。'
@@ -1314,7 +1329,7 @@ node_snapshot() {
   local backup=$1
   [[ ! -f $STACK_DIR/ingress.yaml ]] || cp -p "$STACK_DIR/ingress.yaml" "$backup/shared.yaml" || return 1
   [[ ! -f $STACK_DIR/ingress/Caddyfile ]] || cp -p "$STACK_DIR/ingress/Caddyfile" "$backup/shared.Caddyfile" || return 1
-  docker inspect -f '{{.Image}}' v2ray-ingress > "$backup/ingress.image" 2>/dev/null || true
+  docker inspect -f '{{.Image}}' v2fly-ingress > "$backup/ingress.image" 2>/dev/null || true
   chmod 600 "$backup/"* || return 1
   NODE_TX_BACKUP=$backup NODE_TX_ID=$NODE_ID NODE_TX_IMAGE=${2:-} NODE_TX_EXISTED=${3:-no} NODE_TX_ACTIVE=yes
 }
@@ -1334,13 +1349,13 @@ node_recover() {
     node_restore_files "$backup" || return 1
     [[ -n $oldimage ]] || { red "找不到旧镜像 ID，备份：$backup"; return 1; }
     node_python image "$NODE_ID" "$oldimage" || return 1
-    node_compose up -d --no-deps --force-recreate --pull never v2ray || return 1
+    node_compose up -d --no-deps --force-recreate --pull never v2fly || return 1
   else
     if [[ -f $STACK_DIR/nodes/$NODE_ID/compose.yaml ]]; then node_compose down || return 1; fi
     rm -rf "$STACK_DIR/nodes/$NODE_ID"
   fi
   if [[ ! -s $backup/ingress.image && -f $STACK_DIR/ingress.yaml ]]; then
-    node_owner v2ray-ingress v2ray-ingress || return 1
+    node_owner v2fly-ingress v2fly-ingress || return 1
     docker compose --project-directory "$STACK_DIR" -f "$STACK_DIR/ingress.yaml" down || return 1
   fi
   if [[ -f $backup/shared.yaml ]]; then cp -p "$backup/shared.yaml" "$STACK_DIR/ingress.yaml"; else rm -f "$STACK_DIR/ingress.yaml"; fi
@@ -1474,7 +1489,17 @@ cmd_node_add() {
     echo '0) 返回'
     mode=$(node_choice '远端配置' "$remote_default" "$remote_choices")
     case $mode in
-      1) link=$(node_input vmess '远端 vmess:// 链接' '') || return 0; remote_args=(link "$link"); remote_info='从已填写的 vmess 链接导入（环境就绪后校验）' ;;
+      1)
+        link=$(node_input vmess '远端 vmess:// 链接' '') || return 0
+        remote_args=(link "$link")
+        if command -v python3 >/dev/null; then
+          remote_info=$(node_python preview-link "$link") || return 1
+          printf '\n%s\n' "$remote_info"
+        else
+          remote_info='尚无 Python，暂时无法解析远端链接；环境准备后将校验并显示配置。'
+          ylw "$remote_info"
+        fi
+        ;;
       2)
         rd=$(node_input domain '远端域名' '') || return 0
         rp=$(node_input remote-port '远端端口' 443) || return 0
@@ -1515,13 +1540,13 @@ cmd_node_add() {
     return 1
   fi
   if [[ $edit == no ]]; then NODE_ID=$(node_python allocate) || return 1; fi
-  node_owner "v2ray-node-$NODE_ID" "v2ray-node-$NODE_ID" || return 1
+  node_owner "v2fly-node-$NODE_ID" "v2fly-node-$NODE_ID" || return 1
   open_firewall "$front" || return 1
   mkdir -p "$STACK_DIR/nodes"; chmod 700 "$STACK_DIR/nodes"
   backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX"); chmod 700 "$backup"
   if [[ $existed == yes ]]; then
     cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
-    oldimage=$(docker inspect -f '{{.Image}}' "v2ray-node-$NODE_ID" 2>/dev/null || true)
+    oldimage=$(docker inspect -f '{{.Image}}' "v2fly-node-$NODE_ID" 2>/dev/null || true)
   fi
   node_snapshot "$backup" "$oldimage" "$existed" || return 1
   if [[ $existed == yes && $image == "$previousimage" ]]; then
@@ -1533,7 +1558,7 @@ cmd_node_add() {
     NODE_TX_ACTIVE=no
     return 1
   fi
-  if [[ $image != sha256:* ]] && ! node_compose pull -q v2ray; then
+  if [[ $image != sha256:* ]] && ! node_compose pull -q v2fly; then
     NODE_TX_ACTIVE=no
     if [[ $existed == yes ]]; then node_restore_files "$backup"; else rm -rf "$STACK_DIR/nodes/$NODE_ID"; fi
     red "拉取失败，原节点未改变；备份：$backup"; return 1
@@ -1553,8 +1578,8 @@ cmd_node_manage() {
     1) node_show ;;
     2) cmd_node_add yes ;;
     3) node_test ;;
-    4) docker logs --tail 100 "v2ray-node-$NODE_ID" ;;
-    5) node_compose restart v2ray ;;
+    4) docker logs --tail 100 "v2fly-node-$NODE_ID" ;;
+    5) node_compose restart v2fly ;;
     6) node_delete_selected ;;
     7) cmd_node_update ;;
   esac
@@ -1568,7 +1593,7 @@ node_delete_selected() {
   local backup oldimage
   backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX")
   cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
-  oldimage=$(docker inspect -f '{{.Image}}' "v2ray-node-$NODE_ID" 2>/dev/null || true)
+  oldimage=$(docker inspect -f '{{.Image}}' "v2fly-node-$NODE_ID" 2>/dev/null || true)
   node_snapshot "$backup" "$oldimage" yes || return 1
   if ! node_compose down; then node_recover "$backup" "$oldimage" yes; return 1; fi
   # 元数据暂移出列表，Compose 和原镜像 ID 留在受保护的备份中供恢复。
@@ -1591,10 +1616,10 @@ cmd_node_update() {
   [[ $image =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   backup=$(mktemp -d "$STACK_DIR/.node-recovery.XXXXXX")
   cp -p "$STACK_DIR/nodes/$NODE_ID/"* "$backup/" || return 1
-  oldimage=$(docker inspect -f '{{.Image}}' "v2ray-node-$NODE_ID" 2>/dev/null || true)
+  oldimage=$(docker inspect -f '{{.Image}}' "v2fly-node-$NODE_ID" 2>/dev/null || true)
   node_snapshot "$backup" "$oldimage" yes || return 1
   node_python image "$NODE_ID" "v2fly/v2fly-core:$image" || return 1
-  if ! node_compose pull -q v2ray; then NODE_TX_ACTIVE=no; node_restore_files "$backup"; red "拉取失败；备份：$backup"; return 1; fi
+  if ! node_compose pull -q v2fly; then NODE_TX_ACTIVE=no; node_restore_files "$backup"; red "拉取失败；备份：$backup"; return 1; fi
   node_apply "$backup" "$oldimage" yes || return 1
   NODE_TX_ACTIVE=no
   rm -rf "$backup"
@@ -1613,7 +1638,7 @@ ingress_ready() {
 
 ingress_recover() {
   INGRESS_TX_ACTIVE=no
-  node_owner v2ray-ingress v2ray-ingress || return 1
+  node_owner v2fly-ingress v2fly-ingress || return 1
   [[ -n $INGRESS_TX_IMAGE ]] || return 1
   cp -p "$INGRESS_TX_BACKUP/Caddyfile" "$STACK_DIR/ingress/Caddyfile" || return 1
   cp -p "$INGRESS_TX_BACKUP/compose.yaml" "$STACK_DIR/ingress.yaml" || return 1
@@ -1643,10 +1668,10 @@ cmd_ingress_update() {
   if [[ -z $checks || ! -f $STACK_DIR/ingress.yaml ]]; then
     ylw '暂无共享 Caddy 入口；已有 Nginx 由用户自行更新。'; return 0
   fi
-  node_owner v2ray-ingress v2ray-ingress || return 1
+  node_owner v2fly-ingress v2fly-ingress || return 1
   ylw '更新共享 Caddy 会短暂中断全部 Caddy 节点的连接，客户端需要重连。'
   confirm '确认更新共享 Caddy 到 caddy:2？' n || return 0
-  INGRESS_TX_IMAGE=$(docker inspect -f '{{.Image}}' v2ray-ingress 2>/dev/null) || { red '无法读取现有 Caddy 镜像，停止更新。'; return 1; }
+  INGRESS_TX_IMAGE=$(docker inspect -f '{{.Image}}' v2fly-ingress 2>/dev/null) || { red '无法读取现有 Caddy 镜像，停止更新。'; return 1; }
   [[ $INGRESS_TX_IMAGE =~ ^sha256:[a-f0-9]{64}$ ]] || { red '无法确认原镜像 ID，停止更新。'; return 1; }
   INGRESS_TX_BACKUP=$(mktemp -d "$STACK_DIR/.ingress-recovery.XXXXXX") || return 1
   chmod 700 "$INGRESS_TX_BACKUP" || return 1
@@ -1696,12 +1721,12 @@ cmd_nodes_status() {
   ids=$(node_python ids) || return 1
   while IFS= read -r id; do
     [[ -n $id ]] || continue
-    node_owner "v2ray-node-$id" "v2ray-node-$id" || return 1
-    container_details "v2ray-node-$id" v2ray
+    node_owner "v2fly-node-$id" "v2fly-node-$id" || return 1
+    container_details "v2fly-node-$id" v2ray
   done <<< "$ids"
   if [[ -f $STACK_DIR/ingress.yaml ]]; then
-    node_owner v2ray-ingress v2ray-ingress || return 1
-    container_details v2ray-ingress caddy
+    node_owner v2fly-ingress v2fly-ingress || return 1
+    container_details v2fly-ingress caddy
   fi
   entries=$(node_python entries) || return 1
   while IFS=$'\t' read -r domain front; do
@@ -1714,6 +1739,7 @@ node_menu() {
   echo '======== V2Fly 多节点管理 ========'
   if command -v python3 >/dev/null; then node_python list || return 1;
   else ylw '尚无 Python；可以先填写新增节点，最终确认后统一准备环境。'; fi
+  printf '\n------------------------------\n\n'
   printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 删除节点' '6) 初始化环境' '7) 更新共享 Caddy' '0) 退出'
   case "$(node_choice '请选择' '0' '01234567')" in
     1) cmd_node_add ;;
