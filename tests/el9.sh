@@ -150,7 +150,7 @@ case "$CASE" in
       assert not_contains 'confirm '
       assert not_contains epel-release-latest-9.noarch.rpm
     fi
-    if [[ $CASE == deps_qr_missing ]]; then assert contains 'qrencode 不可用'; assert not_contains 'confirm '; fi
+    if [[ $CASE == deps_qr_missing ]]; then assert not_contains qrencode; assert not_contains '跳过二维码'; assert not_contains 'confirm '; fi
     assert not_contains EPEL-release
     assert not_contains FORBIDDEN
     ;;

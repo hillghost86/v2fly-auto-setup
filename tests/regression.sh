@@ -61,7 +61,7 @@ command(){ if [[ $* == '-v python3' ]]; then return 1; else builtin command "$@"
 node_choice(){ printf 6; }
 node_python(){ return 99; }
 node_menu > "$ROOT/menu"
-[[ $(cat "$ROOT/menu") == *'6) 初始化环境'* && $(cat "$LOG") == *init* ]]
+[[ $(cat "$ROOT/menu") == *$'\n------------------------------\n\n1) 新增节点'* && $(cat "$ROOT/menu") == *'6) 初始化环境'* && $(cat "$LOG") == *init* ]]
 echo 'PASS menu-without-python-permits-init'
 BASH
 

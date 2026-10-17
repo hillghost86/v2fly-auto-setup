@@ -393,8 +393,6 @@ install_deps() {
   else
     red "✗ ca-certificates 未安装"; missing=yes
   fi
-  if command -v qrencode >/dev/null; then grn "✓ qrencode（二维码）";
-  else ylw "⚠ qrencode 不可用，跳过二维码；客户端链接仍可使用。"; fi
   [[ $missing == no ]] || die "核心依赖核验失败，停止安装；请修复上面标记的项目后重试"
   grn "✓ 核心依赖已就绪"
 }
@@ -898,11 +896,21 @@ def create_node(*args):
     render_node(node)
 
 
+def print_remote_summary(remote):
+    print('远端节点配置：')
+    print(f"  地址：{remote['domain']}")
+    print(f"  端口：{remote['port']}")
+    print(f"  UUID：{remote['uuid']}")
+    print('  协议：VMess；传输：WebSocket；TLS：开启（严格验证）')
+    print(f"  WebSocket 路径：{remote['path']}")
+    print(f"  Host：{remote['host']}")
+    print(f"  SNI：{remote['sni']}")
+
+
 def validate_create(*args):
     node = build_node(*args)
     if node['outbound'] == 'relay':
-        remote = node['remote']
-        print(f"远端：{remote['domain']}:{remote['port']}{remote['path']}；Host={remote['host']}；SNI={remote['sni']}")
+        print_remote_summary(node['remote'])
 
 
 def resolve_defaults(port, path, user_id):
@@ -1048,6 +1056,7 @@ HANDLERS = {
     'validate-create': validate_create,
     'defaults': print_defaults,
     'validate-link': validate_link,
+    'preview-link': lambda link: print_remote_summary(parse_remote_link(link)),
     'validate-port': validate_port,
     'validate-path': validate_path,
     'get': get_node,
@@ -1223,13 +1232,19 @@ node_ingress_select() {
 
 install_optional_qr() {
   local policy=$1
-  [[ $policy == allow || $policy == native ]] || return 0
-  command -v qrencode >/dev/null && return 0
+  if command -v qrencode >/dev/null; then grn '✓ qrencode（二维码）已就绪'; return 0; fi
+  case $policy in
+    skip) ylw '按计划不安装二维码工具；客户端链接仍可使用。'; return 0 ;;
+    allow|native) step '按计划安装二维码工具' ;;
+    *) ylw '二维码工具当前不可用；客户端链接仍可使用。'; return 0 ;;
+  esac
   if [[ $OS_FAMILY == el9 ]]; then
     install_qrencode_el9 "$policy" || ylw '二维码工具安装失败，继续使用链接。'
   elif ! apt-get update -qq || ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; then
     ylw '二维码工具安装失败，继续使用链接。'
   fi
+  if command -v qrencode >/dev/null; then grn '✓ qrencode（二维码）已就绪';
+  else ylw '二维码工具未就绪，本次仅提供客户端链接。'; fi
   return 0
 }
 
@@ -1474,7 +1489,17 @@ cmd_node_add() {
     echo '0) 返回'
     mode=$(node_choice '远端配置' "$remote_default" "$remote_choices")
     case $mode in
-      1) link=$(node_input vmess '远端 vmess:// 链接' '') || return 0; remote_args=(link "$link"); remote_info='从已填写的 vmess 链接导入（环境就绪后校验）' ;;
+      1)
+        link=$(node_input vmess '远端 vmess:// 链接' '') || return 0
+        remote_args=(link "$link")
+        if command -v python3 >/dev/null; then
+          remote_info=$(node_python preview-link "$link") || return 1
+          printf '\n%s\n' "$remote_info"
+        else
+          remote_info='尚无 Python，暂时无法解析远端链接；环境准备后将校验并显示配置。'
+          ylw "$remote_info"
+        fi
+        ;;
       2)
         rd=$(node_input domain '远端域名' '') || return 0
         rp=$(node_input remote-port '远端端口' 443) || return 0
@@ -1714,6 +1739,7 @@ node_menu() {
   echo '======== V2Fly 多节点管理 ========'
   if command -v python3 >/dev/null; then node_python list || return 1;
   else ylw '尚无 Python；可以先填写新增节点，最终确认后统一准备环境。'; fi
+  printf '\n------------------------------\n\n'
   printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 删除节点' '6) 初始化环境' '7) 更新共享 Caddy' '0) 退出'
   case "$(node_choice '请选择' '0' '01234567')" in
     1) cmd_node_add ;;
