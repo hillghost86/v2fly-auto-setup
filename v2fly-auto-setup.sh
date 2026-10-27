@@ -48,6 +48,7 @@ E2E_CID_FILES=()
 NODE_TX_ACTIVE=no NODE_TX_BACKUP="" NODE_TX_ID="" NODE_TX_IMAGE="" NODE_TX_EXISTED=no
 INGRESS_TX_ACTIVE=no INGRESS_TX_BACKUP="" INGRESS_TX_IMAGE="" INGRESS_TX_RESTART=no
 NETWORK_TX_ACTIVE=no NETWORK_TX_BACKUP=""
+NODE_NETWORK_RETAIN_NOTICE=no
 SWAP_SOURCE="" SWAP_TARGET="" SWAP_CREATED_ID="" SWAP_ACTIVE=no SWAP_PERSISTED=no
 SWAP_STATUS_FILE=/proc/swaps
 SWAP_FSTAB_CANDIDATE="" SWAP_FSTAB_BACKUP=""
@@ -56,6 +57,7 @@ cleanup() {
   # 清理中的单步失败不能阻止其他临时资源被释放。
   set +e
   cleanup_swap
+  if [[ $NODE_NETWORK_RETAIN_NOTICE == yes ]]; then ylw '节点创建未完成；此前成功启用的 BBR + fq 会保留。'; fi
   if [[ $NETWORK_TX_ACTIVE == yes ]]; then network_recover || red "网络优化恢复失败，保留备份：$NETWORK_TX_BACKUP"; fi
   if [[ $NODE_TX_ACTIVE == yes ]]; then
     NODE_ID=$NODE_TX_ID
@@ -1434,9 +1436,79 @@ node_preview_defaults() {
   printf '%s\n' "$p" "$ws" "$u"
 }
 
+# 只读收集缺失命令对应的软件包；在基础依赖安装后会再次核对实际缺项。
+network_missing_packages() {
+  local tool package
+  NETWORK_MISSING_PACKAGES=()
+  for tool in ip tc modprobe sysctl; do
+    command -v "$tool" >/dev/null && continue
+    case "$OS_FAMILY:$tool" in
+      el9:ip) package=iproute ;;
+      el9:tc) package=iproute-tc ;;
+      el9:modprobe|debian:modprobe) package=kmod ;;
+      el9:sysctl) package=procps-ng ;;
+      debian:ip|debian:tc) package=iproute2 ;;
+      debian:sysctl) package=procps ;;
+      *) red '无法确定网络工具的软件包，停止。'; return 1 ;;
+    esac
+    [[ " ${NETWORK_MISSING_PACKAGES[*]} " == *" $package "* ]] || NETWORK_MISSING_PACKAGES+=("$package")
+  done
+}
+
+plan_node_network() {
+  local choice
+  local NETWORK_MISSING_PACKAGES=()
+  PLAN_NETWORK_PACKAGES=()
+  if [[ -f $STACK_DIR/network-bbr-enabled ]]; then PLAN_NETWORK=enabled; return 0; fi
+  while true; do
+    choice=$(node_ask '是否启用 BBR + fq（Y/n，0 返回）' y) || return 1
+    case "$choice" in
+      y|Y) PLAN_NETWORK=yes; break ;;
+      n|N) PLAN_NETWORK=no; return 0 ;;
+      0) return 1 ;;
+      *) ylw '请输入 y、n 或 0。' >&2 ;;
+    esac
+  done
+  network_missing_packages || return 1
+  PLAN_NETWORK_PACKAGES=("${NETWORK_MISSING_PACKAGES[@]}")
+}
+
+node_network_summary() {
+  case "$PLAN_NETWORK" in
+    yes)
+      echo '网络优化：启用 BBR + fq，作用于宿主机及所有受管节点、共享 Caddy；已有容器将重建并需重连。'
+      echo '首次切换出口 fq 会影响该网卡承载的全机流量；环境准备后核验内核、队列与配置，不支持则停止创建。'
+      if ((${#PLAN_NETWORK_PACKAGES[@]})); then printf '网络工具：按缺项安装 %s\n' "${PLAN_NETWORK_PACKAGES[*]}"; fi
+      ;;
+    enabled) echo '网络优化：已有受管 BBR + fq，新节点继承；不重复配置系统或重建既有容器。' ;;
+    no) echo '网络优化：本次不启用 BBR + fq。' ;;
+  esac
+}
+
+install_node_network_dependencies() {
+  local package
+  local NETWORK_MISSING_PACKAGES=()
+  network_missing_packages || return 1
+  # 只安装最终确认中列出的包；环境变化导致的新缺项须重新规划。
+  for package in "${NETWORK_MISSING_PACKAGES[@]}"; do
+    [[ " ${PLAN_NETWORK_PACKAGES[*]} " == *" $package "* ]] || { red "网络工具缺项已变化，请重新规划：$package"; return 1; }
+  done
+  if ((${#NETWORK_MISSING_PACKAGES[@]})); then
+    if [[ $OS_FAMILY == el9 ]]; then
+      dnf install -y "${NETWORK_MISSING_PACKAGES[@]}" || { red '网络工具安装失败，停止创建。'; return 1; }
+    else
+      apt-get update -qq || { red '网络工具的软件源更新失败，停止创建。'; return 1; }
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${NETWORK_MISSING_PACKAGES[@]}" || { red '网络工具安装失败，停止创建。'; return 1; }
+    fi
+  fi
+  network_missing_packages || return 1
+  ((${#NETWORK_MISSING_PACKAGES[@]} == 0)) || { red '网络工具复检未通过，停止创建。'; return 1; }
+}
+
 cmd_node_add() {
   local edit=${1:-no} d front out p ws u image mode link rd rp ru rw oldimage='' backup existed=no label advanced=no previousimage='' rh rs remote_info='' defaults field
-  local PLAN_CORE PLAN_SWAP PLAN_QR
+  local PLAN_CORE PLAN_SWAP PLAN_QR PLAN_NETWORK=unchanged
+  local PLAN_NETWORK_PACKAGES=()
   local remote_args=() values=()
   workflow_step '1 / 10 只读环境检查'
   preflight
@@ -1527,16 +1599,23 @@ cmd_node_add() {
   workflow_step '7 / 10 环境准备计划'
   plan_low_memory || return 0
   plan_qrencode || return 0
+  if [[ $edit == no ]]; then plan_node_network || return 0; fi
   workflow_step '8 / 10 最终确认'
   printf '节点名称：%s\n类型：%s\n入口：%s（%s）\n路径：%s\n本地端口：%s\nUUID：%s\n镜像：%s\n' "$label" "$(if [[ $out == direct ]]; then echo 本机直出; else echo 远端中转; fi)" "$d" "$(if [[ $front == nginx ]]; then echo 已有Nginx; else echo Caddy; fi)" "$(if [[ $ws == auto ]]; then echo 自动生成; else echo "$ws"; fi)" "$(if [[ $p == auto ]]; then echo 自动分配; else echo "$p"; fi)" "$(if [[ $u == auto ]]; then echo 自动生成; else echo "$u"; fi)" "$image"
   [[ -z $remote_info ]] || echo "$remote_info"
   environment_summary
+  node_network_summary
   if [[ $front == nginx ]]; then ylw 'Nginx 状态：创建后待手工配置 HTTPS 转发。';
   else echo '防火墙：为 Caddy 放行 80/443（仅修改已启用的防火墙）。'; fi
   printf '\n'
   confirm '确认执行以上全部计划？' n || return 0
   workflow_step '9 / 10 执行准备与创建'
   execute_environment_plan || return 1
+  if [[ $PLAN_NETWORK == yes && ! -f $STACK_DIR/network-bbr-enabled ]]; then
+    install_node_network_dependencies || return 1
+    network_enable_execute || return 1
+    NODE_NETWORK_RETAIN_NOTICE=yes
+  fi
   remote_info=$(node_python validate-create "${NODE_ID:-new}" "$d" "$front" "$out" "$p" "$ws" "$u" "$image" ${remote_args[@]+"${remote_args[@]}"}) || return 1
   [[ -z $remote_info ]] || echo "$remote_info"
   if { [[ $edit == no ]] || [[ $p != $(node_get port) ]]; } && port_in_use "$p"; then
@@ -1571,6 +1650,7 @@ cmd_node_add() {
   node_apply "$backup" "$oldimage" "$existed" || return 1
   NODE_TX_ACTIVE=no
   rm -rf "$backup"
+  NODE_NETWORK_RETAIN_NOTICE=no
   workflow_step '10 / 10 创建结果'
   if [[ $front == nginx ]]; then grn '节点本地服务已就绪；Nginx HTTPS 转发待手工配置。'; else grn '节点配置与链路自检已通过。'; fi
   node_show
@@ -2197,7 +2277,14 @@ cmd_network_enable() {
   printf '将重建现有容器并导致连接重连；新增节点继承配置。写入 modules-load/sysctl 配置并保存恢复备份。\n'
   printf '将系统默认队列设为 fq，立即切换当前出口队列；后续新建网卡队列继承默认值，无需重启。\n'
   confirm '确认启用 BBR + fq 并重建本项目所有容器？' n || return 0
-  # 确认之后重新检查路由、队列和系统配置，防止使用过期预检结果。
+  network_enable_execute
+}
+
+# 无交互执行核心：菜单确认或新增节点的最终总确认之后调用。
+network_enable_execute() {
+  local NODE_ID=${NODE_ID:-}
+  need_docker
+  # 执行之前重查路由、队列和配置，不沿用输入阶段的过期结果。
   network_preflight || return 1
   mkdir -p "$STACK_DIR" || return 1
   NETWORK_TX_BACKUP=$(mktemp -d "$STACK_DIR/network-backup.XXXXXXXX") || return 1

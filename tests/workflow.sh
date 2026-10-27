@@ -6,14 +6,18 @@ SCRIPT="$PWD/v2fly-auto-setup.sh"
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 export SCRIPT ROOT
-for test in import-link bootstrap-import port-race same-domain qr-default ready cancel eof type-return invalid-fields occupied-port duplicate-path mixed-front no-python no-python-menu invalid-link remote-invalid no-python-invalid-link missing-core core-failure recheck-failure swap-accept swap-refuse swap-failure qr-allow qr-native qr-skip qr-failure edit-relay nginx-result init-ready init-cancel init-missing; do
+for test in import-link bootstrap-import port-race same-domain qr-default ready cancel eof type-return invalid-fields occupied-port duplicate-path mixed-front no-python no-python-menu invalid-link remote-invalid no-python-invalid-link missing-core core-failure recheck-failure swap-accept swap-refuse swap-failure qr-allow qr-native qr-skip qr-failure edit-relay nginx-result init-ready init-cancel init-missing network-default network-no network-enabled network-cancel network-eof network-bootstrap network-el9 network-failure network-node-failure network-install-failure; do
  status=0
  bash -s -- "$test" <<'BASH' || status=$?
 set -euo pipefail
 source "$SCRIPT"
-TEST=$1; STACK_DIR="$ROOT/$TEST/stack"; LOG="$ROOT/$TEST.events"; : > "$LOG"
+TEST=$1;
+if [[ $TEST != network-* ]]; then plan_node_network(){ [[ $TEST != edit-relay ]] || { event 'FORBIDDEN edit-network-plan'; return 1; }; PLAN_NETWORK=no; PLAN_NETWORK_PACKAGES=(); }; fi
+ STACK_DIR="$ROOT/$TEST/stack"; LOG="$ROOT/$TEST.events"; : > "$LOG"
+HAVE_TC=yes; HAVE_MODPROBE=yes; HAVE_SYSCTL=yes
 IN=0; HAVE_PY=yes; HAVE_CORE=yes; HAVE_DOCKER=yes; HAVE_QR=yes; EPEL=no
-case "$TEST" in bootstrap-import|no-python|no-python-menu|no-python-invalid-link|missing-core|core-failure|recheck-failure|init-missing) HAVE_PY=no; HAVE_CORE=no; HAVE_DOCKER=no ;; esac
+case "$TEST" in bootstrap-import|no-python|no-python-menu|no-python-invalid-link|missing-core|core-failure|recheck-failure|init-missing|network-bootstrap) HAVE_PY=no; HAVE_CORE=no; HAVE_DOCKER=no ;; esac
+case "$TEST" in network-bootstrap|network-el9) HAVE_TC=no; HAVE_MODPROBE=no; HAVE_SYSCTL=no ;; network-install-failure) HAVE_MODPROBE=no ;; esac
 case "$TEST" in qr-*|init-missing) HAVE_QR=no ;; esac
 U=11111111-2222-4333-8444-555555555555
 OLD=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -45,12 +49,15 @@ command(){
    python3) [[ $HAVE_PY == yes ]] ;;
    curl|openssl|ss|ip) [[ $HAVE_CORE == yes ]] ;;
    docker) [[ $HAVE_DOCKER == yes ]] ;;
+   tc) [[ $HAVE_TC == yes ]] ;;
+   modprobe) [[ $HAVE_MODPROBE == yes ]] ;;
+   sysctl) [[ $HAVE_SYSCTL == yes ]] ;;
    qrencode) [[ $HAVE_QR == yes ]] ;;
    *) builtin command "$@" ;;
   esac
  else builtin command "$@"; fi
 }
-preflight(){ OS_FAMILY=debian; [[ $TEST != qr-* ]] || OS_FAMILY=el9; }
+preflight(){ OS_FAMILY=debian; [[ $TEST != qr-* && $TEST != network-el9 ]] || OS_FAMILY=el9; }
 dpkg(){ [[ $HAVE_CORE == yes ]] && echo 'Status: install ok installed'; }
 rpm(){ if [[ $2 == epel-release ]]; then [[ $EPEL == yes ]]; elif [[ $2 == podman-docker ]]; then return 1; else [[ $HAVE_CORE == yes ]]; fi; }
 docker(){
@@ -85,11 +92,24 @@ printf 'Filename Type Size Used Priority\n' > "$SWAPS"
 eval "$(declare -f needs_swap | sed '1s/needs_swap/needs_swap_original/')"
 needs_swap(){ needs_swap_original "$MEM" "$SWAPS"; }
 create_swap(){ mutate Swap; [[ $TEST != swap-failure ]]; }
-install_deps(){ mutate core-deps; [[ $TEST != core-failure ]] || return 1; HAVE_CORE=yes; [[ $TEST == recheck-failure ]] || HAVE_PY=yes; }
+install_deps(){ mutate core-deps; [[ $TEST != core-failure ]] || return 1; HAVE_CORE=yes; [[ $OS_FAMILY != debian ]] || HAVE_TC=yes; [[ $TEST == recheck-failure ]] || HAVE_PY=yes; }
 install_docker(){ mutate Docker; HAVE_DOCKER=yes; }
-apt-get(){ mutate "apt $*"; HAVE_QR=yes; }
+apt-get(){
+ mutate "apt $*"
+ [[ $TEST != network-install-failure ]] || return 1
+ [[ $* != *kmod* ]] || HAVE_MODPROBE=yes
+ [[ $* != *procps* ]] || HAVE_SYSCTL=yes
+ [[ $* != *iproute2* ]] || HAVE_TC=yes
+ HAVE_QR=yes
+}
 dnf(){
  mutate "dnf $*"
+ if [[ $TEST == network-el9 ]]; then
+  [[ $* != *iproute-tc* ]] || HAVE_TC=yes
+  [[ $* != *kmod* ]] || HAVE_MODPROBE=yes
+  [[ $* != *procps-ng* ]] || HAVE_SYSCTL=yes
+  return 0
+ fi
  [[ $TEST != qr-failure ]] || return 1
  if [[ $* == *epel-release-latest-9.noarch.rpm* ]]; then EPEL=yes;
  elif [[ $EPEL == yes ]]; then HAVE_QR=yes;
@@ -99,7 +119,15 @@ qrencode(){ cat >/dev/null; if [[ $* == *ASCII* ]]; then printf '%060d\n' 0; els
 tput(){ echo 100; }
 open_firewall(){ mutate "firewall $1"; }
 node_ingress_apply(){ [[ $TEST != same-domain ]] || node_python ingress; }
-node_ready(){ :; }
+node_ready(){ [[ $TEST != network-node-failure ]]; }
+# 所有网络与包变更都以严格 mutate guard 记录，不触及真实系统。
+network_enable_execute(){
+ mutate network-enable
+ [[ ! -e $STACK_DIR/nodes ]] || { event 'FORBIDDEN new-node-before-network'; return 1; }
+ [[ $TEST != network-failure ]] || return 1
+ mkdir -p "$STACK_DIR"
+ touch "$STACK_DIR/network-bbr-enabled"
+}
 eval "$(declare -f execute_environment_plan | sed '1s/execute_environment_plan/execute_environment_plan_original/')"
 execute_environment_plan(){
  execute_environment_plan_original "$@" || return 1
@@ -107,6 +135,7 @@ execute_environment_plan(){
 }
 
 INPUT="$ROOT/$TEST.input"
+if [[ $TEST == network-enabled ]]; then mkdir -p "$STACK_DIR"; touch "$STACK_DIR/network-bbr-enabled"; fi
 if [[ $TEST == same-domain ]]; then
  node_python create 1 one.example.com caddy direct 2333 /first "$U" v2fly/v2fly-core:latest
  cp "$STACK_DIR/nodes/1/metadata.json" "$ROOT/$TEST.first"
@@ -156,6 +185,10 @@ else
   qr-allow) printf '1\ny\n' >> "$INPUT" ;;
   qr-native|qr-failure) printf '2\ny\n' >> "$INPUT" ;;
   qr-skip) printf '3\ny\n' >> "$INPUT" ;;
+  network-default|network-bootstrap|network-el9|network-failure|network-node-failure|network-install-failure) printf '\ny\n' >> "$INPUT" ;;
+  network-no) printf 'n\ny\n' >> "$INPUT" ;;
+  network-cancel) printf '\nn\n' >> "$INPUT" ;;
+  network-eof) : ;;
   cancel) printf 'n\n' >> "$INPUT" ;;
   eof) : ;;
   *) printf 'y\n' >> "$INPUT" ;;
@@ -166,7 +199,7 @@ if [[ $TEST == no-python-menu ]]; then
  node_menu < "$INPUT" > "$ROOT/$TEST.out" 2> "$ROOT/$TEST.err" || exit 1
 elif [[ $TEST == init-* ]]; then
  cmd_init < "$INPUT" > "$ROOT/$TEST.out" 2> "$ROOT/$TEST.err" || exit 1
-elif [[ $TEST == port-race || $TEST == core-failure || $TEST == recheck-failure || $TEST == swap-failure || $TEST == no-python-invalid-link ]]; then
+elif [[ $TEST == network-failure || $TEST == network-node-failure || $TEST == network-install-failure || $TEST == port-race || $TEST == core-failure || $TEST == recheck-failure || $TEST == swap-failure || $TEST == no-python-invalid-link ]]; then
  if cmd_node_add < "$INPUT" > "$ROOT/$TEST.out" 2> "$ROOT/$TEST.err"; then exit 1; fi
 elif [[ $TEST == import-link || $TEST == invalid-link || $TEST == bootstrap-import ]]; then
  cmd_node_add < "$INPUT" > "$ROOT/$TEST.out" 2>&1 || exit 1
@@ -190,15 +223,57 @@ for expected in ('地址：jp.example.com', '端口：443', 'UUID：' + sys.argv
 PY
 fi
 assert not_contains FORBIDDEN
+if [[ $TEST == network-* ]]; then
+ case "$TEST" in
+  network-enabled)
+   assert not_contains 'INPUT 是否启用 BBR'
+   assert not_contains 'MUTATE network-enable'
+   ;;
+  network-no) assert not_contains 'MUTATE network-enable' ;;
+  network-cancel|network-eof) assert not_contains MUTATE ;;
+  network-default|network-bootstrap|network-el9|network-node-failure)
+   assert contains 'INPUT 是否启用 BBR + fq（Y/n，0 返回） DEFAULT=y'
+   assert contains 'MUTATE network-enable'
+   ;;
+  network-failure) assert test ! -f "$STACK_DIR/network-bbr-enabled" ;;
+  network-install-failure) assert not_contains 'MUTATE network-enable' ;;
+ esac
+ if [[ $TEST == network-default || $TEST == network-no || $TEST == network-enabled || $TEST == network-bootstrap || $TEST == network-el9 ]]; then
+  if [[ $TEST == network-no ]]; then
+   if grep -q tcp_congestion_control "$STACK_DIR/nodes/1/compose.yaml"; then exit 1; fi
+  else assert grep -q 'net.ipv4.tcp_congestion_control: bbr' "$STACK_DIR/nodes/1/compose.yaml"; fi
+ fi
+ if [[ $TEST == network-default || $TEST == network-no || $TEST == network-enabled ]]; then
+  assert not_contains 'MUTATE apt'
+  assert not_contains 'MUTATE dnf'
+ fi
+ if [[ $TEST == network-bootstrap ]]; then
+  assert grep -q '网络工具：按缺项安装' "$ROOT/$TEST.out"
+  assert contains 'MUTATE apt install -y -qq kmod procps'
+  # iproute2 随基础依赖已经准备，不重复网络工具安装。
+  assert not_contains 'MUTATE apt install -y -qq iproute2'
+ elif [[ $TEST == network-el9 ]]; then
+  assert contains 'MUTATE dnf install -y iproute-tc kmod procps-ng'
+ fi
+fi
+if [[ $TEST == edit-relay ]]; then assert not_contains 'INPUT 是否启用 BBR'; fi
 case "$TEST" in
- cancel|eof|type-return|swap-refuse|init-cancel)
+ cancel|eof|type-return|swap-refuse|init-cancel|network-cancel|network-eof)
   assert not_contains MUTATE
   assert test ! -e "$STACK_DIR/nodes"
   ;;
- port-race|core-failure|recheck-failure|swap-failure|no-python-invalid-link)
+ port-race|core-failure|recheck-failure|swap-failure|no-python-invalid-link|network-failure|network-install-failure)
   assert test ! -e "$STACK_DIR/nodes"
   assert not_contains 'docker compose --project-directory'
   if [[ $TEST == port-race ]]; then assert not_contains 'MUTATE firewall'; assert test ! -e "$STACK_DIR/.node-sequence"; fi
+  ;;
+ network-node-failure)
+  assert test -f "$STACK_DIR/network-bbr-enabled"
+  assert test ! -e "$STACK_DIR/nodes/1"
+  [[ $NODE_NETWORK_RETAIN_NOTICE == yes ]] || exit 1
+  cleanup > "$ROOT/$TEST.retained-warning"
+  set -e
+  assert grep -q '此前成功启用的 BBR + fq 会保留' "$ROOT/$TEST.retained-warning"
   ;;
  init-ready) assert not_contains MUTATE ;;
  init-missing) assert contains 'MUTATE core-deps'; assert contains 'MUTATE Docker'; assert test ! -e "$STACK_DIR/nodes" ;;
