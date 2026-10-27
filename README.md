@@ -4,9 +4,11 @@
 
 通过 Docker 部署 V2Fly v5，使用 **VMess + WebSocket + TLS**。每个节点独立运行，共用 HTTPS 入口；支持 Caddy 自动管理证书，也支持接入已有 Nginx / 宝塔站点。
 
-[发布版本 0.3.0](https://github.com/hillghost86/v2fly-auto-setup/releases/tag/0.3.0) · [快速开始](#快速开始) · [宝塔接入](#宝塔--已有-nginx) · [常见问题](#常见问题)
+[发布版本 0.3.1](https://github.com/hillghost86/v2fly-auto-setup/releases/tag/0.3.1) · [快速开始](#快速开始) · [宝塔接入](#宝塔--已有-nginx) · [常见问题](#常见问题)
 
 > **从旧版本升级？先看这里。**
+>
+> `0.3.1` 可以继续管理 `0.3.0` 创建的节点；BBR + fq 需要在菜单中主动启用。
 >
 > `0.3.0` 不支持直接管理 `0.2.0` 或旧单节点版本创建的资源。请先备份节点信息和证书，用旧版管理方式清理旧部署，再重新创建节点。
 >
@@ -59,7 +61,7 @@
 推荐使用固定版本，方便复现配置和排查问题：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.1/v2fly-auto-setup.sh)
 ```
 
 <details>
@@ -74,14 +76,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup
 下载固定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh -o v2fly-auto-setup.sh
+curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.1/v2fly-auto-setup.sh -o v2fly-auto-setup.sh
 bash v2fly-auto-setup.sh
 ```
 
 不要使用 `sudo bash <(curl ...)`，它可能无法读取进程替换生成的脚本。先切换到 root，或使用管道形式：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh | sudo bash -s -- init
+curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.1/v2fly-auto-setup.sh | sudo bash -s -- init
 ```
 
 上面的管道命令只初始化环境，不创建节点。若运行命令本身提示找不到 `curl`，需先通过系统包管理器安装它。
