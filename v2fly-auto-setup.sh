@@ -2049,34 +2049,80 @@ network_recover() {
   return "$rc"
 }
 
-network_check_sysctl_conflicts() {
-  local file=$1 line
-  while IFS= read -r line || [[ -n $line ]]; do
-    line=${line%%#*}; line=${line%%;*}
-    if [[ $line =~ ^[[:space:]]*-?net[./]ipv4[./]tcp_congestion_control[[:space:]]*=[[:space:]]*([^[:space:]]+) ]]; then
-      [[ ${BASH_REMATCH[1]} == bbr ]] || { red "发现拥塞算法配置冲突，请先人工处理：$file"; return 1; }
-    fi
-    if [[ $line =~ ^[[:space:]]*-?net[./]core[./]default_qdisc[[:space:]]*=[[:space:]]*([^[:space:]]+) ]]; then
-      [[ ${BASH_REMATCH[1]} == fq ]] || { red "发现默认队列配置冲突，请先人工处理：$file"; return 1; }
-    fi
-  done < "$file"
+# 模拟加入受管配置后的 sysctl.d 文件选择；不修改发行版或管理员文件。
+network_check_sysctl_priority() {
+  python3 - "${1:-/}" <<'PY'
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+managed = '90-v2fly-bbr.conf'
+targets = {'net.ipv4.tcp_congestion_control': 'bbr', 'net.core.default_qdisc': 'fq'}
+selected, seen_dirs = {}, set()
+
+def values(path):
+    if path.is_symlink() and path.resolve() == pathlib.Path('/dev/null'):
+        return []
+    result = []
+    for line in path.read_text(errors='replace').splitlines():
+        line = re.split(r'[#;]', line, maxsplit=1)[0]
+        match = re.match(r'\s*-?([^\s=]+)\s*=\s*(\S+)', line)
+        if match:
+            key = match[1].replace('/', '.')
+            if key in targets:
+                result.append((key, match[2]))
+    return result
+
+try:
+    # 同名文件目录优先级；/lib 可能是 /usr/lib 的别名，只枚举一次。
+    for folder in ('etc/sysctl.d', 'run/sysctl.d', 'usr/local/lib/sysctl.d', 'usr/lib/sysctl.d', 'lib/sysctl.d'):
+        directory = root / folder
+        resolved = directory.resolve()
+        if resolved in seen_dirs:
+            continue
+        seen_dirs.add(resolved)
+        if directory.exists():
+            for path in directory.glob('*.conf'):
+                selected.setdefault(path.name, (path, folder == 'etc/sysctl.d'))
+    parsed = {name: values(path) for name, (path, _) in selected.items()}
+    # 管理员的 /etc 配置即便排序较早，也不静默压过；独立 sysctl.conf 同样保护。
+    for name, (path, admin) in selected.items():
+        if admin:
+            for key, value in dict(parsed[name]).items():
+                if value != targets[key]:
+                    raise ValueError('管理员 sysctl 配置冲突，请先人工处理：' + str(path))
+    admin_conf = root / 'etc/sysctl.conf'
+    if admin_conf.exists() or admin_conf.is_symlink():
+        for key, value in dict(values(admin_conf)).items():
+            if value != targets[key]:
+                raise ValueError('管理员 sysctl 配置冲突，请先人工处理：' + str(admin_conf))
+    # 受管 /etc 文件覆盖其他目录的同名文件，再按跨目录文件名顺序计算最终值。
+    parsed[managed] = list(targets.items())
+    effective = {}
+    origins = {}
+    for name in sorted(parsed):
+        for key, value in parsed[name]:
+            effective[key] = value
+            origins[key] = name
+    for key, desired in targets.items():
+        if effective.get(key) != desired:
+            path = selected[origins[key]][0]
+            raise ValueError('后置 sysctl 配置会覆盖网络优化，请先人工处理：' + str(path))
+except (OSError, ValueError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 network_preflight() {
   local file value
   for value in python3 modprobe; do
-    command -v "$value" >/dev/null || { red "缺少 $value；请先初始化环境。"; return 1; }
+    command -v "$value" >/dev/null || { red "缺少 ${value}；请先初始化环境。"; return 1; }
   done
   [[ -d /run/systemd/system ]] || { red '当前系统未使用 systemd，无法持久化网络配置。'; return 1; }
   [[ ! -e $STACK_DIR/network-bbr-enabled ]] || { red '已有网络优化配置；请查看网络状态，不重复覆盖。'; return 1; }
   for file in /etc/modules-load.d/90-v2fly-bbr.conf /etc/sysctl.d/90-v2fly-bbr.conf; do
     [[ ! -e $file && ! -L $file ]] || { red "文件已存在，不覆盖：$file"; return 1; }
   done
-  # 全部位置都检查；不依赖 sysctl.d 文件优先级去压过用户配置。
-  for file in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; do
-    [[ -f $file ]] || continue
-    network_check_sysctl_conflicts "$file" || return 1
-  done
+  network_check_sysctl_priority || return 1
   network_inspect || return 1
   # dry-run 只检查模块是否可用；真正加载发生在确认后。
   modprobe -n tcp_bbr && modprobe -n sch_fq || { red '内核缺少 BBR 或 fq 模块。'; return 1; }
@@ -2234,23 +2280,33 @@ cmd_nodes_status() {
   done <<< "$entries"
 }
 
+# 与 main 一样直接调用动作，保留原有 errexit 和信号恢复语义。
 node_menu() {
-  echo '======== V2Fly 多节点管理 ========'
-  if command -v python3 >/dev/null; then node_python list || return 1;
-  else ylw '尚无 Python；可以先填写新增节点，最终确认后统一准备环境。'; fi
-  printf '\n------------------------------\n\n'
-  printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 删除节点' '6) 初始化环境' '7) 更新共享 Caddy' '8) 启用 BBR + fq' '9) 网络优化状态' '0) 退出'
-  case "$(node_choice '请选择' '0' '0123456789')" in
-    1) cmd_node_add ;;
-    2) cmd_node_manage ;;
-    5) cmd_node_delete ;;
-    3) cmd_nodes_status ;;
-    4) node_select && cmd_node_update ;;
-    6) cmd_init ;;
-    7) cmd_ingress_update ;;
-    8) cmd_network_enable ;;
-    9) network_status ;;
-  esac
+  local choice
+  while true; do
+    echo '======== V2Fly 多节点管理 ========'
+    if command -v python3 >/dev/null; then node_python list || return 1;
+    else ylw '尚无 Python；可以先填写新增节点，最终确认后统一准备环境。'; fi
+    printf '\n------------------------------\n\n'
+    printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 删除节点' '6) 初始化环境' '7) 更新共享 Caddy' '8) 启用 BBR + fq' '9) 网络优化状态' '0) 退出'
+    choice=$(node_choice '请选择' '0' '0123456789')
+    [[ $choice != 0 ]] || return 0
+    case "$choice" in
+      1) cmd_node_add ;;
+      2) cmd_node_manage ;;
+      3) cmd_nodes_status ;;
+      4) node_select && cmd_node_update ;;
+      5) cmd_node_delete ;;
+      6) cmd_init ;;
+      7) cmd_ingress_update ;;
+      8) cmd_network_enable ;;
+      9) network_status ;;
+    esac
+    # 长期菜单在动作成功后释放临时测试资源；成功事务已经清除各自 ACTIVE 标记。
+    cleanup
+    TMP_DIRS=() E2E_CID_FILES=() E2E_CID_FILE=''
+    set -e
+  done
 }
 
 main() {

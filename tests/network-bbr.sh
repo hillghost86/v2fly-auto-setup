@@ -342,8 +342,39 @@ check network_recover
 eval "$network_write_real"
 check network_write_persistence "$STACK_DIR/modules.conf" "$STACK_DIR/sysctl.conf"
 check grep -q 'net.core.default_qdisc = fq' "$STACK_DIR/sysctl.conf"
-printf 'net.core.default_qdisc = fq_codel' > "$STACK_DIR/conflict.conf"
-if network_check_sysctl_conflicts "$STACK_DIR/conflict.conf" >/dev/null; then exit 1; fi
+# sysctl.d 按 basename 排序、同名目录优先级以及管理员保护。
+SYSROOT=$STACK_DIR/sysctl-fixture
+reset_sysctl_fixture() {
+  builtin command rm -rf "$SYSROOT"
+  mkdir -p "$SYSROOT/etc/sysctl.d" "$SYSROOT/run/sysctl.d" "$SYSROOT/usr/local/lib/sysctl.d" "$SYSROOT/usr/lib/sysctl.d"
+  ln -s usr/lib "$SYSROOT/lib"
+  printf 'net.core.default_qdisc = fq_codel\nnet.ipv4.tcp_congestion_control = cubic\n' > "$SYSROOT/usr/lib/sysctl.d/50-default.conf"
+}
+reset_sysctl_fixture
+check network_check_sysctl_priority "$SYSROOT"
+printf 'net.core.default_qdisc = fq_codel\n' > "$SYSROOT/usr/lib/sysctl.d/99-late.conf"
+if network_check_sysctl_priority "$SYSROOT" >/dev/null 2>&1; then exit 1; fi
+ln -s /dev/null "$SYSROOT/etc/sysctl.d/99-late.conf"
+check network_check_sysctl_priority "$SYSROOT"
+builtin command rm "$SYSROOT/etc/sysctl.d/99-late.conf"
+printf 'net.core.default_qdisc = fq\n' > "$SYSROOT/etc/sysctl.d/99-late.conf"
+check network_check_sysctl_priority "$SYSROOT"
+reset_sysctl_fixture
+printf 'net.core.default_qdisc = fq_codel\n' > "$SYSROOT/etc/sysctl.d/10-admin.conf"
+if network_check_sysctl_priority "$SYSROOT" >/dev/null 2>&1; then exit 1; fi
+reset_sysctl_fixture
+printf 'net.ipv4.tcp_congestion_control = cubic\n' > "$SYSROOT/etc/sysctl.conf"
+if network_check_sysctl_priority "$SYSROOT" >/dev/null 2>&1; then exit 1; fi
+reset_sysctl_fixture
+printf 'net.core.default_qdisc = fq_codel\n' > "$SYSROOT/usr/lib/sysctl.d/99-shared.conf"
+printf 'net.core.default_qdisc = fq\n' > "$SYSROOT/run/sysctl.d/99-shared.conf"
+check network_check_sysctl_priority "$SYSROOT"
+printf 'net.core.default_qdisc = fq_codel\n' > "$SYSROOT/run/sysctl.d/99-shared.conf"
+if network_check_sysctl_priority "$SYSROOT" >/dev/null 2>&1; then exit 1; fi
+reset_sysctl_fixture
+printf 'net.core.default_qdisc = fq_codel\n' > "$SYSROOT/usr/lib/sysctl.d/99-shared.conf"
+printf 'net.core.default_qdisc = fq\n' > "$SYSROOT/usr/local/lib/sysctl.d/99-shared.conf"
+check network_check_sysctl_priority "$SYSROOT"
 state=$(network_status)
 [[ $state == *'系统默认队列：fq_codel'* && $state == *'宿主机拥塞算法：cubic'* ]] || exit 1
 printf 'PASS strict tc parser, exact JSON rollback, ECN/pacing preservation, container algorithms and phase-aware recovery\n'

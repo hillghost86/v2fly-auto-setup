@@ -28,7 +28,7 @@ mutate(){
 }
 eval "$(declare -f node_ask | sed '1s/node_ask/node_ask_original/')"
 node_ask(){
- [[ ! -e $ROOT/$TEST.executing ]] || { event 'FORBIDDEN input-after-mutation'; return 99; }
+ [[ ! -e $ROOT/$TEST.executing || ( $TEST == no-python-menu && $1 == 请选择 ) ]] || { event 'FORBIDDEN input-after-mutation'; return 99; }
  event "INPUT $1 DEFAULT=${2:-}"
  node_ask_original "$@"
 }
