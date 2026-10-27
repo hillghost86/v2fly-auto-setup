@@ -58,7 +58,8 @@ echo 'PASS legacy-cli-removed'
 # 新服务器没有 Python 也能进入初始化入口。
 eval "$(sed -n '/^node_menu() {/,/^}/p' "$SCRIPT")"
 command(){ if [[ $* == '-v python3' ]]; then return 1; else builtin command "$@"; fi; }
-node_choice(){ printf 6; }
+printf '6\n0\n' > "$ROOT/menu-choices"
+node_choice(){ local next; next=$(head -1 "$ROOT/menu-choices"); tail -n +2 "$ROOT/menu-choices" > "$ROOT/menu-choices.next"; mv "$ROOT/menu-choices.next" "$ROOT/menu-choices"; printf '%s' "$next"; }
 node_python(){ return 99; }
 node_menu > "$ROOT/menu"
 [[ $(cat "$ROOT/menu") == *$'\n------------------------------\n\n1) 新增节点'* && $(cat "$ROOT/menu") == *'6) 初始化环境'* && $(cat "$LOG") == *init* ]]
@@ -152,3 +153,65 @@ node_python ingress
 [[ $(cat "$STACK_DIR/compose.yaml") == 'old compose' ]]
 echo 'PASS fixed-root-no-old-helpers-or-import'
 BASH
+
+# 直接菜单动作：正常查看/操作后循环，0/EOF 退出；成功动作释放临时资源。
+bash <<'BASH'
+set -euo pipefail
+source "$SCRIPT"
+STACK_DIR="$ROOT/menu-stack"; IN=0; MENU_LOG="$ROOT/menu-actions"
+node_python(){ :; }
+network_status(){ printf 'status\n' >> "$MENU_LOG"; }
+docker(){ [[ $* == 'rm -f mock-menu-test' ]] || return 1; printf 'removed-test-container\n' >> "$MENU_LOG"; }
+cmd_network_enable(){
+ local action_tmp
+ printf 'enable\n' >> "$MENU_LOG"
+ mktmp action_tmp
+ printf '%s\n' "$action_tmp" > "$ROOT/menu-temp-path"
+ printf 'mock-menu-test\n' > "$action_tmp/container.cid"
+ E2E_CID_FILES+=("$action_tmp/container.cid")
+ mkdir -p "$STACK_DIR"
+ touch "$STACK_DIR/successful-transaction"
+}
+printf '9\n8\n0\n' > "$ROOT/menu-input"
+node_menu < "$ROOT/menu-input" > "$ROOT/menu-loop.out"
+[[ $(cat "$MENU_LOG") == $'status\nenable\nremoved-test-container' ]] || exit 1
+[[ $(grep -c '======== V2Fly 多节点管理' "$ROOT/menu-loop.out") -eq 3 ]] || exit 1
+[[ ! -e $(cat "$ROOT/menu-temp-path") && -f $STACK_DIR/successful-transaction ]] || exit 1
+[[ ${#TMP_DIRS[@]} -eq 0 && ${#E2E_CID_FILES[@]} -eq 0 && $- == *e* ]] || exit 1
+: > "$MENU_LOG"
+node_menu < /dev/null > "$ROOT/menu-eof.out"
+[[ ! -s $MENU_LOG ]] || exit 1
+printf '9\n' > "$ROOT/menu-input"
+node_menu < "$ROOT/menu-input" > "$ROOT/menu-status-eof.out"
+[[ $(cat "$MENU_LOG") == status ]] || exit 1
+echo 'PASS menu-loop-status-enable-exit-eof-and-temp-cleanup'
+BASH
+# 使用真实 network 入口和预检：缺少模块工具时安全退出，不继续更改网络或容器。
+menu_preflight_status=0
+bash <<'BASH' || menu_preflight_status=$?
+set -euo pipefail
+source "$SCRIPT"
+IN=0; STACK_DIR="$ROOT/menu-preflight-stack"
+node_python(){ :; }
+need_docker(){ :; }
+command(){ if [[ $* == '-v modprobe' ]]; then return 1; fi; builtin command "$@"; }
+network_apply(){ printf 'FORBIDDEN-apply\n' >> "$ROOT/menu-preflight.log"; }
+network_status(){ printf 'FORBIDDEN-status\n' >> "$ROOT/menu-preflight.log"; }
+node_menu <<< $'8\n9\n0' > "$ROOT/menu-preflight.out"
+BASH
+[[ $menu_preflight_status -ne 0 && ! -e $ROOT/menu-preflight.log && ! -e $ROOT/menu-preflight-stack ]] || exit 1
+grep -q '缺少 modprobe' "$ROOT/menu-preflight.out" || exit 1
+echo 'PASS menu-real-network-preflight-failure-stops-safely'
+# 普通 fatal 错误保留原有立即退出行为，false 后的写入和下一菜单项均不能执行。
+menu_fatal_status=0
+bash <<'BASH' || menu_fatal_status=$?
+set -euo pipefail
+source "$SCRIPT"
+IN=0
+node_python(){ :; }
+cmd_network_enable(){ printf 'before-failure\n' >> "$ROOT/menu-fatal.log"; false; printf 'FORBIDDEN-write\n' >> "$ROOT/menu-fatal.log"; }
+network_status(){ printf 'FORBIDDEN-status\n' >> "$ROOT/menu-fatal.log"; }
+node_menu <<< $'8\n9\n0' > "$ROOT/menu-fatal.out"
+BASH
+[[ $menu_fatal_status -ne 0 && $(cat "$ROOT/menu-fatal.log") == before-failure ]] || exit 1
+echo 'PASS menu-fatal-error-does-not-continue-writing'

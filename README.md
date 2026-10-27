@@ -4,9 +4,11 @@
 
 通过 Docker 部署 V2Fly v5，使用 **VMess + WebSocket + TLS**。每个节点独立运行，共用 HTTPS 入口；支持 Caddy 自动管理证书，也支持接入已有 Nginx / 宝塔站点。
 
-[发布版本 0.3.0](https://github.com/hillghost86/v2fly-auto-setup/releases/tag/0.3.0) · [快速开始](#快速开始) · [宝塔接入](#宝塔--已有-nginx) · [常见问题](#常见问题)
+[发布版本 0.3.1](https://github.com/hillghost86/v2fly-auto-setup/releases/tag/0.3.1) · [快速开始](#快速开始) · [宝塔接入](#宝塔--已有-nginx) · [常见问题](#常见问题)
 
 > **从旧版本升级？先看这里。**
+>
+> `0.3.1` 可以继续管理 `0.3.0` 创建的节点；BBR + fq 需要在菜单中主动启用。
 >
 > `0.3.0` 不支持直接管理 `0.2.0` 或旧单节点版本创建的资源。请先备份节点信息和证书，用旧版管理方式清理旧部署，再重新创建节点。
 >
@@ -59,7 +61,7 @@
 推荐使用固定版本，方便复现配置和排查问题：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.1/v2fly-auto-setup.sh)
 ```
 
 <details>
@@ -74,14 +76,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup
 下载固定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh -o v2fly-auto-setup.sh
+curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.1/v2fly-auto-setup.sh -o v2fly-auto-setup.sh
 bash v2fly-auto-setup.sh
 ```
 
 不要使用 `sudo bash <(curl ...)`，它可能无法读取进程替换生成的脚本。先切换到 root，或使用管道形式：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.0/v2fly-auto-setup.sh | sudo bash -s -- init
+curl -fsSL https://raw.githubusercontent.com/hillghost86/v2fly-auto-setup/0.3.1/v2fly-auto-setup.sh | sudo bash -s -- init
 ```
 
 上面的管道命令只初始化环境，不创建节点。若运行命令本身提示找不到 `curl`，需先通过系统包管理器安装它。
@@ -156,11 +158,17 @@ location = /example-path {
 | 5) 删除节点 | 选择一个节点并确认删除 |
 | 6) 初始化环境 | 单独准备依赖、Docker 或二维码工具，不创建节点 |
 | 7) 更新共享 Caddy | 更新所有 Caddy 节点共用的 HTTPS 入口 |
+| 8) 启用 BBR + fq | 检查并配置宿主机与本项目容器的网络优化 |
+| 9) 网络优化状态 | 查看宿主机、节点容器的拥塞算法和出口网卡队列 |
 | 0) 退出 | 结束本次操作 |
 
 删除节点会保留 Docker、系统依赖、其他节点和证书卷。删除最后一个 Caddy 节点时，会停止共享入口，但仍保留证书卷。
 
 修改或更新失败时，脚本会尝试恢复变更前的配置和镜像；如果恢复失败，会提示备份位置。共享 Caddy 更新或配置重载可能导致已有连接重连。
+
+启用 BBR + fq 前会展示影响并要求确认：宿主机默认算法改为 BBR，出口网卡使用 fq，本项目现有节点和共享 Caddy 会重建，新节点继承配置。fq 会影响该网卡上的其他流量；实际速度提升取决于线路。操作前会检查默认路由、队列及现有设置，不支持的队列、冲突的配置或未运行的节点需要先人工处理。如果之前手工添加过 `compose.override.yaml`，需要先处理该文件，脚本不会自动覆盖。启用后可通过「网络优化状态」检查实际结果；删除节点不会自动撤销宿主机设置。请保管脚本提示的备份目录，其中可能包含节点凭据。
+
+fq 通过 `net.core.default_qdisc=fq` 持久化，首次启用会立即切换出口队列，无需重启服务器；多队列网卡保留 mq，子队列使用 fq。以后启动时由系统默认设置创建队列，不安装额外的 fq 开机服务；其他网络管理程序若覆盖队列，需通过状态菜单检查实际结果。
 
 **容器显示 running 只代表进程在运行。** 请再执行节点连接测试，并在客户端切换节点、查询出口 IP，确认实际线路符合预期。
 
@@ -285,6 +293,7 @@ bash tests/management.sh
 bash tests/environment.sh
 bash tests/qr-install.sh
 bash tests/workflow.sh
+bash tests/network-bbr.sh
 ```
 
 测试需要 Bash 和 Python 3，使用临时目录和模拟命令，不下载依赖、不操作真实 Docker 或系统配置。模拟测试不能代替各支持系统上的真实部署验证。
