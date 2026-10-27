@@ -13,7 +13,7 @@
 
 - 在独立特性分支修改；默认远程分支为 `main`。
 - 基础语法检查：`bash -n v2fly-auto-setup.sh`。
-- 模拟回归检查：`bash tests/regression.sh`、`bash tests/el9.sh`、`bash tests/swap.sh`、`bash tests/nodes.sh`、`bash tests/management.sh`、`bash tests/environment.sh`、`bash tests/qr-install.sh` 和 `bash tests/workflow.sh`，无需 Docker 服务或额外测试框架。
+- 模拟回归检查：`bash tests/regression.sh`、`bash tests/el9.sh`、`bash tests/swap.sh`、`bash tests/nodes.sh`、`bash tests/management.sh`、`bash tests/environment.sh`、`bash tests/qr-install.sh`、`bash tests/workflow.sh` 和 `bash tests/network-bbr.sh`，无需 Docker 服务或额外测试框架。
 - 本地验证使用模拟的 Docker、APT、DNF、防火墙和网络命令，不能直接运行脚本的安装、更新或卸载子命令。
 - 模拟检查不能代替 Debian / Ubuntu、Rocky Linux 9、AlmaLinux 9 和 CentOS Stream 9 上的真实部署验证，交付时明确未验证范围。
 - 安装依赖、真实容器操作及服务器部署需另行获得用户授权。

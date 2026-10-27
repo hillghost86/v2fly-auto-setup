@@ -47,6 +47,7 @@ E2E_CID_FILE=""
 E2E_CID_FILES=()
 NODE_TX_ACTIVE=no NODE_TX_BACKUP="" NODE_TX_ID="" NODE_TX_IMAGE="" NODE_TX_EXISTED=no
 INGRESS_TX_ACTIVE=no INGRESS_TX_BACKUP="" INGRESS_TX_IMAGE="" INGRESS_TX_RESTART=no
+NETWORK_TX_ACTIVE=no NETWORK_TX_BACKUP=""
 SWAP_SOURCE="" SWAP_TARGET="" SWAP_CREATED_ID="" SWAP_ACTIVE=no SWAP_PERSISTED=no
 SWAP_STATUS_FILE=/proc/swaps
 SWAP_FSTAB_CANDIDATE="" SWAP_FSTAB_BACKUP=""
@@ -55,6 +56,7 @@ cleanup() {
   # 清理中的单步失败不能阻止其他临时资源被释放。
   set +e
   cleanup_swap
+  if [[ $NETWORK_TX_ACTIVE == yes ]]; then network_recover || red "网络优化恢复失败，保留备份：$NETWORK_TX_BACKUP"; fi
   if [[ $NODE_TX_ACTIVE == yes ]]; then
     NODE_ID=$NODE_TX_ID
     node_recover "$NODE_TX_BACKUP" "$NODE_TX_IMAGE" "$NODE_TX_EXISTED" || red "节点恢复失败，备份：$NODE_TX_BACKUP"
@@ -764,6 +766,7 @@ def render_node(node):
     write(folder / 'config.json', config)
     # Compose 内嵌配置避免宿主文件挂载造成 SELinux 标签冲突。
     embedded = ''.join('      ' + line + '\n' for line in config.splitlines())
+    bbr = '    sysctls:\n      net.ipv4.tcp_congestion_control: bbr\n' if (root / 'network-bbr-enabled').is_file() else ''
     compose = f'''name: v2fly-node-{node['id']}
 services:
   v2fly:
@@ -771,7 +774,7 @@ services:
     container_name: v2fly-node-{node['id']}
     restart: unless-stopped
     command: run -c /etc/v2fly/config.json
-    ports:
+{bbr}    ports:
       - "127.0.0.1:{node['port']}:2333"
     configs:
       - source: node_config
@@ -818,6 +821,7 @@ def render_ingress():
         lines.extend(['  handle {', '    respond "It works!" 200', '  }', '}'])
         sections.append('\n'.join(lines))
     write(root / 'ingress' / 'Caddyfile', '\n'.join(sections) + '\n')
+    bbr = '    sysctls:\n      net.ipv4.tcp_congestion_control: bbr\n' if (root / 'network-bbr-enabled').is_file() else ''
     write(root / 'ingress.yaml', f'''name: v2fly-ingress
 services:
   caddy:
@@ -825,7 +829,7 @@ services:
     container_name: v2fly-ingress
     restart: unless-stopped
     command: caddy run --config /managed/Caddyfile --adapter caddyfile
-    ports:
+{bbr}    ports:
       - "80:80"
       - "443:443"
     volumes:
@@ -1714,20 +1718,515 @@ certificate_details() {
   else ylw '证书读取失败，请检查 HTTPS 服务和域名配置。'; fi
 }
 
+# tc JSON 保留整数精度：rate 是字节/秒，普通时间是微秒，timer_slack 是纳秒。
+network_qdisc_plan() {
+  python3 - "$1" <<'PY'
+import json, re, sys
+
+def integer(value, maximum=0xffffffff):
+    if type(value) is not int or not 0 <= value <= maximum:
+        raise ValueError('无效整数队列参数')
+    return value
+
+def plan(raw):
+    data = json.loads(raw)
+    if not isinstance(data, list) or not data:
+        raise ValueError('队列 JSON 缺失')
+    result = []
+    for q in data:
+        if not isinstance(q, dict) or set(q) - {'kind', 'handle', 'root', 'parent', 'refcnt', 'options'}:
+            raise ValueError('未知队列属性')
+        kind, handle, parent = q.get('kind'), q.get('handle'), q.get('parent')
+        if kind not in ('mq', 'fq', 'fq_codel') or not re.fullmatch(r'[0-9a-f]+:', handle or ''):
+            raise ValueError('未知队列类型或句柄')
+        if q.get('root') is True:
+            if parent is not None:
+                raise ValueError('队列根与父级冲突')
+        elif not isinstance(parent, str) or not re.fullmatch(r'[0-9a-f]*:[0-9a-f]+', parent):
+            raise ValueError('无效父级')
+        options = q.get('options', {})
+        if not isinstance(options, dict):
+            raise ValueError('未知队列选项')
+        options = dict(options)
+        # iproute2 的 PRINT_ANY 数组标签在 JSON 中保留尾空格，仅接纳这两个已知别名。
+        if kind == 'fq':
+            for alias, canonical in (('priomap ', 'priomap'), ('weights ', 'weights')):
+                if alias in options:
+                    if canonical in options:
+                        raise ValueError('队列数组字段别名冲突')
+                    options[canonical] = options.pop(alias)
+        plain = {'limit', 'flow_limit', 'buckets', 'orphan_mask', 'quantum', 'initial_quantum'} if kind == 'fq' else {'limit', 'flows', 'quantum', 'drop_batch', 'memory_limit'}
+        times = {'refill_delay', 'horizon', 'ce_threshold', 'offload_horizon'} if kind == 'fq' else {'target', 'interval', 'ce_threshold'}
+        rates = {'maxrate', 'low_rate_threshold'} if kind == 'fq' else set()
+        allowed = plain | times | rates
+        allowed |= {'pacing', 'timer_slack', 'bands', 'priomap', 'weights', 'horizon_drop', 'horizon_cap'} if kind == 'fq' else {'ecn'}
+        if (kind == 'mq' and options) or (kind != 'mq' and set(options) - allowed):
+            raise ValueError('未知队列选项')
+        if kind == 'fq':
+            options.setdefault('low_rate_threshold', 0)
+        if kind == 'mq' and parent is not None:
+            raise ValueError('mq 只能作为根队列')
+        args = []
+        for key, value in sorted(options.items()):
+            if key in ('pacing', 'ecn', 'bands', 'priomap', 'weights'):
+                continue
+            if key in plain:
+                args += [key, str(integer(value))]
+            elif key in times:
+                args += [key, str(integer(value)) + 'us']
+            elif key in rates:
+                args += [key, str(integer(value) * 8) + 'bit']
+            elif key == 'timer_slack':
+                args += [key, str(integer(value)) + 'ns']
+            elif key in ('horizon_drop', 'horizon_cap'):
+                if value is not None or {'horizon_drop', 'horizon_cap'} <= options.keys():
+                    raise ValueError('无效 horizon 选项')
+                args += [key]
+        if kind == 'fq':
+            pacing = options.get('pacing', True)
+            if type(pacing) is not bool:
+                raise ValueError('无效 pacing 状态')
+            args += ['pacing' if pacing else 'nopacing']
+            if 'bands' in options or 'priomap' in options:
+                priomap = options.get('priomap')
+                if options.get('bands') != 3 or not isinstance(priomap, list) or len(priomap) != 16:
+                    raise ValueError('无效 bands / priomap')
+                args += ['bands', '3', 'priomap'] + [str(integer(v, 2)) for v in priomap]
+            if 'weights' in options:
+                weights = options['weights']
+                if not isinstance(weights, list) or len(weights) != 3 or any(integer(v, 0x7fffffff) == 0 for v in weights):
+                    raise ValueError('无效 weights')
+                args += ['weights'] + [str(v) for v in weights]
+        elif kind == 'fq_codel':
+            ecn = options.get('ecn', False)
+            if type(ecn) is not bool:
+                raise ValueError('无效 ECN 状态')
+            args += ['ecn' if ecn else 'noecn']
+        result.append({'kind': kind, 'handle': handle, 'parent': parent, 'args': args})
+    roots = [q for q in result if q['parent'] is None]
+    if len(roots) != 1:
+        raise ValueError('队列根不唯一')
+    root = roots[0]
+    if root['kind'] == 'mq':
+        major = ':' if root['handle'] == '0:' else root['handle']
+        parents = [q['parent'] for q in result if q['parent'] is not None]
+        if len(parents) != len(result) - 1 or not parents or len(set(parents)) != len(parents) or any(not p.startswith(major) for p in parents):
+            raise ValueError('mq 子队列归属不明确')
+    elif len(result) != 1:
+        raise ValueError('未知队列结构')
+    return result
+try:
+    print(json.dumps(plan(sys.argv[1]), separators=(',', ':'), sort_keys=True))
+except (ValueError, TypeError, KeyError) as error:
+    print('无法安全恢复队列：' + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+# 匿名 mq 可保留具名根；比较调度类型、父级序号及全部规范化选项。
+network_qdisc_equal() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+
+def signature(raw):
+    return sorted((q['parent'].split(':', 1)[1] if q['parent'] is not None else '', q['kind'], q['args']) for q in json.loads(raw))
+sys.exit(0 if signature(sys.argv[1]) == signature(sys.argv[2]) else 1)
+PY
+}
+
+# 只读检查：拒绝不明确的默认出口及未知队列，避免覆盖用户整形配置。
+network_inspect() {
+  local routes line output roots children kind parent handle root_kind='' count=0
+  command -v ip >/dev/null && command -v tc >/dev/null && command -v sysctl >/dev/null || {
+    red '缺少 ip、tc 或 sysctl，无法检查网络优化。'; return 1;
+  }
+  routes=$(ip -o route show default 2>/dev/null) || return 1
+  [[ $(printf '%s\n' "$routes" | sed '/^$/d' | wc -l) -eq 1 ]] || {
+    red '默认路由不唯一，无法确定要优化的出口网卡。'; return 1;
+  }
+  NETWORK_IFACE=$(printf '%s\n' "$routes" | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')
+  [[ $NETWORK_IFACE =~ ^[a-zA-Z0-9_.-]+$ ]] || { red '无法识别有效的出口网卡。'; return 1; }
+  output=$(tc qdisc show dev "$NETWORK_IFACE") || return 1
+  NETWORK_QDISC_OUTPUT=$output
+  NETWORK_QDISC_JSON=$(tc -j qdisc show dev "$NETWORK_IFACE") || return 1
+  NETWORK_QDISC_PLAN=$(network_qdisc_plan "$NETWORK_QDISC_JSON") || return 1
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    read -r _ kind _ _ <<< "$line"
+    if [[ $line == *' root'* ]]; then
+      [[ -z $root_kind ]] || { red '存在多个根队列，停止网络优化。'; return 1; }
+      root_kind=$kind
+    elif [[ $line == *' parent '* ]]; then
+      case "$kind" in fq|fq_codel) ;; *) red '检测到未知子队列，停止网络优化。'; return 1 ;; esac
+      count=$((count + 1))
+    else
+      red '检测到未知队列结构，停止网络优化。'; return 1
+    fi
+  done <<< "$output"
+  case "$root_kind:$count" in
+    fq:0|fq_codel:0) NETWORK_QDISC_KIND=single ;;
+    mq:*) (( count > 0 )) || { red '多队列缺少可见子队列。'; return 1; }; NETWORK_QDISC_KIND=mq ;;
+    *) red '检测到不支持的出口队列结构，停止网络优化。'; return 1 ;;
+  esac
+  if [[ $NETWORK_QDISC_KIND == mq ]]; then
+    handle=$(printf '%s\n' "$NETWORK_QDISC_OUTPUT" | awk '$2=="mq" && $0 ~ / root/ {print $3; exit}')
+    [[ $handle != 0: ]] || handle=:
+    children=' '
+    while IFS= read -r line; do
+      [[ $line == *' parent '* ]] || continue
+      parent=$(printf '%s\n' "$line" | awk '{for(i=1;i<NF;i++) if($i=="parent") {print $(i+1);exit}}')
+      [[ $parent == "$handle"* && $children != *" $parent "* ]] || { red 'mq 子队列归属不明确或重复，停止。'; return 1; }
+      children+="$parent "
+    done <<< "$NETWORK_QDISC_OUTPUT"
+  fi
+  output=$(tc filter show dev "$NETWORK_IFACE" 2>/dev/null) || return 1
+  [[ -z $output ]] || { red '检测到网卡流量过滤规则，停止网络优化。'; return 1; }
+}
+
+# 使用 network_inspect 的只读结果；调用方须保存原始队列并处理失败。
+network_set_fq() {
+  local line handle parent kind
+  if [[ $NETWORK_QDISC_KIND == single ]]; then
+    if [[ $NETWORK_QDISC_OUTPUT != 'qdisc fq '* ]]; then
+      touch "$NETWORK_TX_BACKUP/queue-started" || return 1
+      tc qdisc replace dev "$NETWORK_IFACE" root fq || return 1
+    fi
+  else
+    handle=$(printf '%s\n' "$NETWORK_QDISC_OUTPUT" | awk '$2=="mq" && $0 ~ / root/ {print $3; exit}')
+    if [[ $handle == 0: ]]; then
+      touch "$NETWORK_TX_BACKUP/queue-started" || return 1
+      tc qdisc replace dev "$NETWORK_IFACE" root handle 1: mq || return 1
+      NETWORK_QDISC_OUTPUT=$(tc qdisc show dev "$NETWORK_IFACE") || return 1
+    fi
+    while IFS= read -r line; do
+      [[ $line == *' parent '* ]] || continue
+      kind=$(printf '%s\n' "$line" | awk '{print $2}')
+      [[ $kind != fq ]] || continue
+      parent=$(printf '%s\n' "$line" | awk '{for(i=1;i<NF;i++) if($i=="parent") {print $(i+1);exit}}')
+      [[ $parent =~ ^[0-9a-f]*:[0-9a-f]+$ ]] || return 1
+      touch "$NETWORK_TX_BACKUP/queue-started" || return 1
+      tc qdisc replace dev "$NETWORK_IFACE" parent "$parent" fq || return 1
+    done <<< "$NETWORK_QDISC_OUTPUT"
+  fi
+}
+
+# 此函数只负责生成受管文件；调用者须先验证目标文件不存在并建立恢复记录。
+network_write_persistence() {
+  local modules_file=$1 sysctl_file=$2
+  mkdir -p "$(dirname "$modules_file")" "$(dirname "$sysctl_file")" || return 1
+  printf 'tcp_bbr\nsch_fq\n' > "$modules_file" || return 1
+  printf 'net.ipv4.tcp_congestion_control = bbr\nnet.core.default_qdisc = fq\n' > "$sysctl_file" || return 1
+}
+
+# 仅用于明确启用网络优化的集中操作，不改变其他项目的容器。
+network_recreate_node() {
+  local id=$1 image=$2 override=$3
+  NODE_ID=$id
+  printf 'services:\n  v2fly:\n    image: %s\n' "$image" > "$override" || return 1
+  node_compose -f "$STACK_DIR/nodes/$id/compose.yaml" -f "$override" config -q || return 1
+  node_compose -f "$STACK_DIR/nodes/$id/compose.yaml" -f "$override" up -d --no-deps --force-recreate --pull never v2fly || return 1
+  [[ $(docker exec "v2fly-node-$id" cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null) == bbr ]] || return 1
+  if [[ $(node_get front) == caddy ]]; then
+    docker network connect v2fly-ingress_default "v2fly-node-$id" || return 1
+  fi
+  wait_for node_local_ok 6
+}
+
+# 网络优化变更先记录各容器真实镜像，避免标签指向新镜像导致误升级。
+network_snapshot_containers() {
+  local backup=$1 id image ids congestion
+  ids=$(node_python ids) || return 1
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    node_owner "v2fly-node-$id" "v2fly-node-$id" || return 1
+    [[ $(docker inspect -f '{{.State.Running}}' "v2fly-node-$id") == true ]] || { red "节点 $id 未运行，请先处理后重试。"; return 1; }
+    [[ ! -e $STACK_DIR/nodes/$id/compose.override.yaml && ! -e $STACK_DIR/nodes/$id/compose.override.yml ]] || {
+      red "节点 $id 存在 Compose override，请先手工处理后重试。"; return 1;
+    }
+    image=$(docker inspect -f '{{.Image}}' "v2fly-node-$id" 2>/dev/null) || return 1
+    [[ $image =~ ^sha256:[a-f0-9]{64}$ ]] || return 1
+    mkdir -p "$backup/nodes/$id" || return 1
+    cp -p "$STACK_DIR/nodes/$id/compose.yaml" "$backup/nodes/$id/compose.yaml" || return 1
+    printf '%s\n' "$image" > "$backup/nodes/$id/image" || return 1
+    congestion=$(docker exec "v2fly-node-$id" cat /proc/sys/net/ipv4/tcp_congestion_control) || return 1
+    [[ $congestion =~ ^[a-zA-Z0-9_]+$ ]] || return 1
+    printf '%s\n' "$congestion" > "$backup/nodes/$id/congestion" || return 1
+  done <<< "$ids"
+  if [[ -f $STACK_DIR/ingress.yaml ]]; then
+    node_owner v2fly-ingress v2fly-ingress || return 1
+    [[ ! -e $STACK_DIR/compose.override.yaml && ! -e $STACK_DIR/compose.override.yml ]] || { red '共享入口存在 Compose override，停止。'; return 1; }
+    [[ $(docker inspect -f '{{.State.Running}}' v2fly-ingress) == true ]] || return 1
+    image=$(docker inspect -f '{{.Image}}' v2fly-ingress 2>/dev/null) || return 1
+    [[ $image =~ ^sha256:[a-f0-9]{64}$ ]] || return 1
+    cp -p "$STACK_DIR/ingress.yaml" "$backup/ingress.yaml" || return 1
+    printf '%s\n' "$image" > "$backup/ingress.image" || return 1
+    congestion=$(docker exec v2fly-ingress cat /proc/sys/net/ipv4/tcp_congestion_control) || return 1
+    [[ $congestion =~ ^[a-zA-Z0-9_]+$ ]] || return 1
+    printf '%s\n' "$congestion" > "$backup/ingress.congestion" || return 1
+  fi
+}
+
+# 结构化快照生成合法参数；首条 tc 失败且状态未变化时直接跳过恢复。
+network_restore_qdisc() {
+  local original current raw root_handle row commands weights_index rc=0
+  local -a args
+  original=$(cat "$NETWORK_TX_BACKUP/qdisc-plan.json") || return 1
+  raw=$(tc -j qdisc show dev "$NETWORK_IFACE") || return 1
+  current=$(network_qdisc_plan "$raw") || return 1
+  network_qdisc_equal "$original" "$current" && return 0
+  root_handle=$(python3 -c 'import json,sys; print(next(q["handle"] for q in json.loads(sys.argv[1]) if q["parent"] is None))' "$current") || return 1
+  commands=$(python3 - "$original" "$root_handle" <<'PY'
+import json, sys
+for q in json.loads(sys.argv[1]):
+    if q['kind'] == 'mq':
+        continue
+    parent = q['parent']
+    args = ['root'] if parent is None else ['parent', sys.argv[2] + parent.split(':', 1)[1]]
+    if q['handle'] != '0:':
+        args += ['handle', q['handle']]
+    print(' '.join(args + [q['kind']] + q['args']))
+PY
+  ) || return 1
+  while IFS= read -r row; do
+    read -r -a args <<< "$row"
+    if tc qdisc replace dev "$NETWORK_IFACE" "${args[@]}"; then continue; fi
+    # 部分 iproute2 的 weights 解析器多前进一次；仅在标准三值失败时补一个占位 0。
+    # 正常解析器会拒绝 0，不会误应用；两条路径都必须通过下方实际 JSON 核验。
+    weights_index=$((${#args[@]} - 4))
+    if (( weights_index >= 0 )) && [[ ${args[$weights_index]} == weights ]]; then
+      args=("${args[@]:0:$((weights_index + 1))}" 0 "${args[@]:$((weights_index + 1))}")
+      tc qdisc replace dev "$NETWORK_IFACE" "${args[@]}" || rc=1
+    else rc=1; fi
+  done <<< "$commands"
+  raw=$(tc -j qdisc show dev "$NETWORK_IFACE") || return 1
+  current=$(network_qdisc_plan "$raw") || return 1
+  network_qdisc_equal "$original" "$current" || rc=1
+  return "$rc"
+}
+
+network_recover() {
+  NETWORK_TX_ACTIVE=no
+  local backup=$NETWORK_TX_BACKUP id image congestion rc=0 override
+  # 恢复所有文件后再重建已开始变更的容器；镜像固定为操作前的 ID。
+  if [[ -f $backup/host-started ]]; then
+    rm -f /etc/modules-load.d/90-v2fly-bbr.conf /etc/sysctl.d/90-v2fly-bbr.conf || rc=1
+    sysctl -w "net.core.default_qdisc=$(cat "$backup/default-qdisc")" >/dev/null || rc=1
+    sysctl -w "net.ipv4.tcp_congestion_control=$(cat "$backup/congestion")" >/dev/null || rc=1
+    NETWORK_IFACE=$(cat "$backup/iface")
+    if [[ -f $backup/queue-started ]]; then network_restore_qdisc || rc=1; fi
+  fi
+  rm -f "$STACK_DIR/network-bbr-enabled" || rc=1
+  for id in "$backup"/nodes/*; do
+    [[ -d $id ]] || continue
+    cp -p "$id/compose.yaml" "$STACK_DIR/nodes/${id##*/}/compose.yaml" || rc=1
+  done
+  [[ ! -f $backup/ingress.yaml ]] || cp -p "$backup/ingress.yaml" "$STACK_DIR/ingress.yaml" || rc=1
+  for id in "$backup"/nodes/*; do
+    [[ -f $id/started ]] || continue
+    NODE_ID=${id##*/}; image=$(cat "$id/image"); override=$id/image-override.yaml
+    congestion=$(cat "$id/congestion") || { rc=1; continue; }
+    [[ $congestion =~ ^[a-zA-Z0-9_]+$ ]] || { rc=1; continue; }
+    printf 'services:\n  v2fly:\n    image: %s\n    sysctls:\n      net.ipv4.tcp_congestion_control: %s\n' "$image" "$congestion" > "$override" || { rc=1; continue; }
+    if node_compose -f "$STACK_DIR/nodes/$NODE_ID/compose.yaml" -f "$override" up -d --no-deps --force-recreate --pull never v2fly; then
+      if [[ $(node_get front) == caddy ]]; then
+        docker network connect v2fly-ingress_default "v2fly-node-$NODE_ID" || rc=1
+      fi
+      wait_for node_local_ok 6 || rc=1
+      [[ $(docker exec "v2fly-node-$NODE_ID" cat /proc/sys/net/ipv4/tcp_congestion_control) == "$congestion" ]] || rc=1
+    else rc=1; fi
+  done
+  if [[ -f $backup/ingress-started ]]; then
+    image=$(cat "$backup/ingress.image"); override=$backup/ingress-image-override.yaml
+    congestion=$(cat "$backup/ingress.congestion") || return 1
+    [[ $congestion =~ ^[a-zA-Z0-9_]+$ ]] || return 1
+    printf 'services:\n  caddy:\n    image: %s\n    sysctls:\n      net.ipv4.tcp_congestion_control: %s\n' "$image" "$congestion" > "$override" || rc=1
+    ingress_compose -f "$override" up -d --no-deps --force-recreate --pull never caddy || rc=1
+    ingress_ready || rc=1
+    [[ $(docker exec v2fly-ingress cat /proc/sys/net/ipv4/tcp_congestion_control) == "$congestion" ]] || rc=1
+  fi
+  if (( rc == 0 )); then ylw "已恢复原配置、拥塞算法、叶子队列参数和容器（匿名 mq 根保留具名句柄）。备份保留：$backup"
+  else red "恢复不完整；请根据备份人工恢复：$backup"; fi
+  return "$rc"
+}
+
+network_check_sysctl_conflicts() {
+  local file=$1 line
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}; line=${line%%;*}
+    if [[ $line =~ ^[[:space:]]*-?net[./]ipv4[./]tcp_congestion_control[[:space:]]*=[[:space:]]*([^[:space:]]+) ]]; then
+      [[ ${BASH_REMATCH[1]} == bbr ]] || { red "发现拥塞算法配置冲突，请先人工处理：$file"; return 1; }
+    fi
+    if [[ $line =~ ^[[:space:]]*-?net[./]core[./]default_qdisc[[:space:]]*=[[:space:]]*([^[:space:]]+) ]]; then
+      [[ ${BASH_REMATCH[1]} == fq ]] || { red "发现默认队列配置冲突，请先人工处理：$file"; return 1; }
+    fi
+  done < "$file"
+}
+
+network_preflight() {
+  local file value
+  for value in python3 modprobe; do
+    command -v "$value" >/dev/null || { red "缺少 $value；请先初始化环境。"; return 1; }
+  done
+  [[ -d /run/systemd/system ]] || { red '当前系统未使用 systemd，无法持久化网络配置。'; return 1; }
+  [[ ! -e $STACK_DIR/network-bbr-enabled ]] || { red '已有网络优化配置；请查看网络状态，不重复覆盖。'; return 1; }
+  for file in /etc/modules-load.d/90-v2fly-bbr.conf /etc/sysctl.d/90-v2fly-bbr.conf; do
+    [[ ! -e $file && ! -L $file ]] || { red "文件已存在，不覆盖：$file"; return 1; }
+  done
+  # 全部位置都检查；不依赖 sysctl.d 文件优先级去压过用户配置。
+  for file in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; do
+    [[ -f $file ]] || continue
+    network_check_sysctl_conflicts "$file" || return 1
+  done
+  network_inspect || return 1
+  # dry-run 只检查模块是否可用；真正加载发生在确认后。
+  modprobe -n tcp_bbr && modprobe -n sch_fq || { red '内核缺少 BBR 或 fq 模块。'; return 1; }
+  sysctl -n net.ipv4.tcp_congestion_control >/dev/null || return 1
+  sysctl -n net.core.default_qdisc >/dev/null || return 1
+}
+
+network_add_sysctl() {
+  python3 - "$1" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+if '    sysctls:' in s:
+    raise SystemExit('已有容器 sysctls，停止以免覆盖用户配置')
+needle = '    restart: unless-stopped\n'
+if s.count(needle) != 1:
+    raise SystemExit('无法识别受管 Compose 文件')
+p.write_text(s.replace(needle, needle + '    sysctls:\n      net.ipv4.tcp_congestion_control: bbr\n'))
+PY
+}
+
+network_apply() {
+  local backup=$NETWORK_TX_BACKUP id image override
+  # 操作前先检查所有 Compose 文件均可修改，避免变更中途才发现配置冲突。
+  for id in "$backup"/nodes/*; do
+    [[ -d $id ]] || continue
+    cp -p "$id/compose.yaml" "$id/planned.yaml" || return 1
+    network_add_sysctl "$id/planned.yaml" || return 1
+    NODE_ID=${id##*/}
+    node_compose -f "$id/planned.yaml" config -q || return 1
+  done
+  if [[ -f $backup/ingress.yaml ]]; then
+    cp -p "$backup/ingress.yaml" "$backup/ingress-planned.yaml" || return 1
+    network_add_sysctl "$backup/ingress-planned.yaml" || return 1
+    ingress_compose -f "$backup/ingress-planned.yaml" config -q || return 1
+  fi
+  # 从此标记起，任何失败或信号都会进入恢复；模块保留加载，不卸载共享内核模块。
+  touch "$backup/host-started" || return 1
+  modprobe tcp_bbr && modprobe sch_fq || return 1
+  [[ " $(sysctl -n net.ipv4.tcp_available_congestion_control) " == *' bbr '* ]] || return 1
+  network_write_persistence /etc/modules-load.d/90-v2fly-bbr.conf /etc/sysctl.d/90-v2fly-bbr.conf || return 1
+  sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null || return 1
+  sysctl -w net.core.default_qdisc=fq >/dev/null || return 1
+  network_set_fq || return 1
+  touch "$STACK_DIR/network-bbr-enabled" || return 1
+  for id in "$backup"/nodes/*; do
+    [[ -d $id ]] || continue
+    cp -p "$id/planned.yaml" "$STACK_DIR/nodes/${id##*/}/compose.yaml" || return 1
+    image=$(cat "$id/image"); touch "$id/started" || return 1
+    network_recreate_node "${id##*/}" "$image" "$id/image-override.yaml" || return 1
+  done
+  if [[ -f $backup/ingress.yaml ]]; then
+    cp -p "$backup/ingress-planned.yaml" "$STACK_DIR/ingress.yaml" || return 1
+    image=$(cat "$backup/ingress.image"); override=$backup/ingress-image-override.yaml
+    printf 'services:\n  caddy:\n    image: %s\n' "$image" > "$override" || return 1
+    touch "$backup/ingress-started" || return 1
+    ingress_compose -f "$override" up -d --no-deps --force-recreate --pull never caddy || return 1
+    [[ $(docker exec v2fly-ingress cat /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] || return 1
+    ingress_ready || return 1
+  fi
+  [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr ]] || return 1
+  [[ $(sysctl -n net.core.default_qdisc) == fq ]] || return 1
+  network_inspect || return 1
+  [[ $NETWORK_QDISC_OUTPUT != *fq_codel* ]] || return 1
+}
+
+cmd_network_enable() {
+  need_docker
+  network_preflight || return 1
+  printf '计划：宿主机和本项目所有节点、共享 Caddy 使用 BBR；%s 使用 fq（保留 mq 根队列）。\n' "$NETWORK_IFACE"
+  printf '匿名 mq 根需重建为具名 mq（1:），短暂重置叶子；恢复时恢复叶子参数，保留具名 mq 根。\n'
+  printf '将重建现有容器并导致连接重连；新增节点继承配置。写入 modules-load/sysctl 配置并保存恢复备份。\n'
+  printf '将系统默认队列设为 fq，立即切换当前出口队列；后续新建网卡队列继承默认值，无需重启。\n'
+  confirm '确认启用 BBR + fq 并重建本项目所有容器？' n || return 0
+  # 确认之后重新检查路由、队列和系统配置，防止使用过期预检结果。
+  network_preflight || return 1
+  mkdir -p "$STACK_DIR" || return 1
+  NETWORK_TX_BACKUP=$(mktemp -d "$STACK_DIR/network-backup.XXXXXXXX") || return 1
+  chmod 700 "$NETWORK_TX_BACKUP" || return 1
+  printf '%s\n' "$NETWORK_IFACE" > "$NETWORK_TX_BACKUP/iface" || return 1
+  printf '%s\n' "$NETWORK_QDISC_OUTPUT" > "$NETWORK_TX_BACKUP/qdisc" || return 1
+  printf '%s\n' "$NETWORK_QDISC_JSON" > "$NETWORK_TX_BACKUP/qdisc.json" || return 1
+  printf '%s\n' "$NETWORK_QDISC_PLAN" > "$NETWORK_TX_BACKUP/qdisc-plan.json" || return 1
+  sysctl -n net.ipv4.tcp_congestion_control > "$NETWORK_TX_BACKUP/congestion" || return 1
+  sysctl -n net.core.default_qdisc > "$NETWORK_TX_BACKUP/default-qdisc" || return 1
+  network_snapshot_containers "$NETWORK_TX_BACKUP" || { red "预检失败，系统未修改。备份：$NETWORK_TX_BACKUP"; return 1; }
+  NETWORK_TX_ACTIVE=yes
+  if network_apply; then
+    NETWORK_TX_ACTIVE=no
+    grn "BBR + fq 已启用；备份：$NETWORK_TX_BACKUP"
+    network_status
+  else
+    red '网络优化失败，开始恢复。'
+    network_recover || return 1
+    return 1
+  fi
+}
+
+network_status() {
+  local value route iface id ids
+  printf '\n网络优化：\n'
+  if [[ -f $STACK_DIR/network-bbr-enabled ]]; then echo '  管理配置：已启用'; else echo '  管理配置：未启用'; fi
+  if command -v docker >/dev/null && command -v python3 >/dev/null; then
+    ids=$(node_python ids 2>/dev/null || true)
+    while IFS= read -r id; do
+      [[ -n $id ]] || continue
+      value=$(docker exec "v2fly-node-$id" cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
+      printf '  节点 %s 拥塞算法：%s\n' "$id" "${value:-无法读取}"
+    done <<< "$ids"
+    if [[ -f $STACK_DIR/ingress.yaml ]]; then
+      value=$(docker exec v2fly-ingress cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
+      printf '  共享 Caddy 拥塞算法：%s\n' "${value:-无法读取}"
+    fi
+  fi
+  value=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  printf '  宿主机拥塞算法：%s\n' "${value:-无法读取}"
+  value=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+  printf '  系统默认队列：%s\n' "${value:-无法读取}"
+  route=$(ip -o route show default 2>/dev/null || true)
+  if [[ $(printf '%s\n' "$route" | sed '/^$/d' | wc -l) -eq 1 ]]; then
+    iface=$(printf '%s\n' "$route" | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    if [[ -n $iface ]]; then
+      printf '  默认出口网卡：%s\n' "$iface"
+      if command -v tc >/dev/null; then tc qdisc show dev "$iface" || ylw '  无法读取出口队列';
+      else ylw '  未安装 tc，无法读取出口队列'; fi
+      return 0
+    fi
+  fi
+  ylw '  默认出口不唯一或无法读取，请手工检查路由与队列。'
+}
+
 cmd_nodes_status() {
   need_docker; node_python list || return 1
-  local id entries domain front
+  local id entries domain front value
   local ids
   ids=$(node_python ids) || return 1
   while IFS= read -r id; do
     [[ -n $id ]] || continue
     node_owner "v2fly-node-$id" "v2fly-node-$id" || return 1
     container_details "v2fly-node-$id" v2ray
+    value=$(docker exec "v2fly-node-$id" cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
+    printf '  容器拥塞算法：%s\n' "${value:-无法读取}"
   done <<< "$ids"
   if [[ -f $STACK_DIR/ingress.yaml ]]; then
     node_owner v2fly-ingress v2fly-ingress || return 1
     container_details v2fly-ingress caddy
+    value=$(docker exec v2fly-ingress cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
+    printf '  容器拥塞算法：%s\n' "${value:-无法读取}"
   fi
+  network_status
   entries=$(node_python entries) || return 1
   while IFS=$'\t' read -r domain front; do
     [[ -n $domain ]] || continue
@@ -1740,8 +2239,8 @@ node_menu() {
   if command -v python3 >/dev/null; then node_python list || return 1;
   else ylw '尚无 Python；可以先填写新增节点，最终确认后统一准备环境。'; fi
   printf '\n------------------------------\n\n'
-  printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 删除节点' '6) 初始化环境' '7) 更新共享 Caddy' '0) 退出'
-  case "$(node_choice '请选择' '0' '01234567')" in
+  printf '%s\n' '1) 新增节点' '2) 管理节点' '3) 所有节点状态' '4) 更新指定节点' '5) 删除节点' '6) 初始化环境' '7) 更新共享 Caddy' '8) 启用 BBR + fq' '9) 网络优化状态' '0) 退出'
+  case "$(node_choice '请选择' '0' '0123456789')" in
     1) cmd_node_add ;;
     2) cmd_node_manage ;;
     5) cmd_node_delete ;;
@@ -1749,6 +2248,8 @@ node_menu() {
     4) node_select && cmd_node_update ;;
     6) cmd_init ;;
     7) cmd_ingress_update ;;
+    8) cmd_network_enable ;;
+    9) network_status ;;
   esac
 }
 
@@ -1761,8 +2262,10 @@ main() {
     node-update) need_root node-update; need_docker; node_select && cmd_node_update ;;
     node-delete) need_root node-delete; cmd_node_delete ;;
     ingress-update) need_root ingress-update; cmd_ingress_update ;;
+    network-enable) need_root network-enable; cmd_network_enable ;;
+    network-status) need_root network-status; network_status ;;
     "") need_root; node_menu ;;
-    *) die "未知命令: $1（可用: init node-add node-manage nodes node-update node-delete ingress-update）" ;;
+    *) die "未知命令: $1（可用: init node-add node-manage nodes node-update node-delete ingress-update network-enable network-status）" ;;
   esac
 }
 
