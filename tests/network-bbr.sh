@@ -378,3 +378,24 @@ check network_check_sysctl_priority "$SYSROOT"
 state=$(network_status)
 [[ $state == *'系统默认队列：fq_codel'* && $state == *'宿主机拥塞算法：cubic'* ]] || exit 1
 printf 'PASS strict tc parser, exact JSON rollback, ECN/pacing preservation, container algorithms and phase-aware recovery\n'
+
+# 无交互核心不读取菜单确认；批量处理节点不能污染新增流程的 NODE_ID。
+(
+ need_docker(){ :; }
+ network_preflight(){ network_inspect; }
+ network_snapshot_containers(){ :; }
+ network_apply(){ NODE_ID=existing-node; touch "$STACK_DIR/network-bbr-enabled"; }
+ network_status(){ :; }
+ confirm(){ echo FORBIDDEN-confirm > "$STACK_DIR/forbidden-interaction"; return 99; }
+ node_ask(){ echo FORBIDDEN-input > "$STACK_DIR/forbidden-interaction"; return 99; }
+ NODE_ID=new-node-context
+ check network_enable_execute
+ [[ $NODE_ID == new-node-context ]] || exit 1
+ check test ! -e "$STACK_DIR/forbidden-interaction"
+ # 独立菜单取消仍然零执行；保持它自己的预检与确认包装。
+ confirm(){ return 1; }
+ network_enable_execute(){ touch "$STACK_DIR/forbidden-core"; }
+ check cmd_network_enable
+ check test ! -e "$STACK_DIR/forbidden-core"
+)
+echo 'PASS noninteractive network core, node context preservation and menu cancellation'
